@@ -1,14 +1,13 @@
 # Modem Harness
+<img width="981" height="625" alt="demo" src="https://github.com/user-attachments/assets/bb8202c7-b6e0-4203-8510-a684334d53e5" />
 
 [![Python](https://img.shields.io/badge/python-3.7+-blue.svg)](https://www.python.org/downloads/)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-lightgrey.svg)](#requirements)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-A standalone Python tool for LTE module testing with CMUX (GSM 07.10) multiplexing, PPP dialup, and FTP speed testing over serial port. Supports both CMUX and raw serial transport modes — all features available in both.
+A pluggable LTE module testing platform — AT commands, CMUX multiplexing, PPP dialup, TUN networking, and built-in FTP/iperf3 benchmarking. Harness architecture: add new services without touching existing code.
 
 **Requirements:** Python 3.7+, `pyserial`, and `wintun.dll` for TUN support.
-
-![demo](demo.gif)
 
 ## Features
 
