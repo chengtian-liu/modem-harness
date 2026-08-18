@@ -119,7 +119,8 @@ class TcpTestProtocol(asyncio.Protocol):
         """
         Write data to transport.
         """
-        self._transport.write(data)
+        if self._transport and not self._transport.is_closing():
+            self._transport.write(data)
 
     def pause_writing(self):
         """

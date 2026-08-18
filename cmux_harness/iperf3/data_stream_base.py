@@ -162,6 +162,13 @@ class BaseTestStream(object):
             # Not a biggy, try later...
             self._logger.exception('[%s] Stream Out-of-Memory: ', self.socket_id, exc_info=exc)
             return
+        except Exception:
+            # Socket broken (e.g. PPP link dropped, connection reset)
+            self._logger.debug('[%s] send failed, stopping stream', self.socket_id)
+            if self._sending_handle:
+                self._sending_handle.cancel()
+                self._sending_handle = None
+            return
 
         self._blocks_tx_this_interval += 1
         self._bytes_tx_this_interval += len(data_block)
