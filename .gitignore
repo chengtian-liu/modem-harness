@@ -7,6 +7,7 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+*.spec
 
 # Virtual environments
 venv/
@@ -31,4 +32,4 @@ Thumbs.db
 *.log
 
 # Command history
-.cmux_terminal_history
+.modem_harness_history

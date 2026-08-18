@@ -92,6 +92,20 @@ class PppService(ServiceInterface):
                 i += 1
             else:
                 i += 1
+
+        # Prompt for hardware flow control
+        self._hw_flow = False
+        try:
+            ans = input('  Enable hardware flow control (RTS/CTS)? (requires RTS/CTS wired, USB modems OK) [y/N]: ').strip().lower()
+            if ans in ('y', 'yes'):
+                sp = self._harness.transport.serial_port
+                if sp:
+                    sp.rtscts = True
+                    self._hw_flow = True
+                    print('  RTS/CTS flow control enabled')
+        except (EOFError, KeyboardInterrupt):
+            pass
+
         self.start(dlci, apn)
         return None
 
@@ -171,6 +185,17 @@ class PppService(ServiceInterface):
             if self._ppp_thread:
                 self._ppp_thread.join(timeout=5)
             self._harness.transport.dialing = False
+
+            # Restore hardware flow control
+            if self._hw_flow:
+                try:
+                    sp = self._harness.transport.serial_port
+                    if sp:
+                        sp.rtscts = False
+                        self._hw_flow = False
+                except Exception:
+                    pass
+
             print(f"  [PPP] stopped")
         else:
             print(f"  PPP not running")

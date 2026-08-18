@@ -1,4 +1,4 @@
-# CMUX Terminal
+# Modem Harness
 
 [![Python](https://img.shields.io/badge/python-3.7+-blue.svg)](https://www.python.org/downloads/)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-lightgrey.svg)](#requirements)
@@ -8,14 +8,16 @@ A standalone Python tool for LTE module testing with CMUX (GSM 07.10) multiplexi
 
 **Requirements:** Python 3.7+, `pyserial`, and `wintun.dll` for TUN support.
 
+![demo](demo.gif)
+
 ## Features
 
 **Transport layer** — two modes, all features supported in both:
 
-| Mode | Flag | Description |
-|---|---|---|
-| **CMUX** (default) | — | GSM 07.10 multiplexing — AT commands and PPP data run simultaneously on separate DLCI channels. |
-| **Direct Serial** | `--serial` | Raw serial — no CMUX overhead, simpler to debug. Same feature set, different transport. |
+| Mode                | Flag       | Description                                                                                      |
+|---------------------|------------|--------------------------------------------------------------------------------------------------|
+| **CMUX** (default)  | —          | GSM 07.10 multiplexing — AT commands and PPP data run simultaneously on separate DLCI channels.  |
+| **Direct Serial**   | `--serial` | Raw serial — no CMUX overhead, simpler to debug. Same feature set, different transport.          |
 
 **Application layer** — available in both modes:
 
@@ -23,10 +25,39 @@ A standalone Python tool for LTE module testing with CMUX (GSM 07.10) multiplexi
 - **PPP dialup** — LCP/IPCP/IPv6CP negotiation with PAP authentication
 - **TUN virtual adapter** — route system TCP/IP traffic through the PPP serial link
 - **ICMP ping** — built-in connectivity testing
-- **FTP speed testing** — upload/download throughput measurement over the PPP connection
+- **FTP** — upload/download throughput measurement over the PPP connection
 - **iperf3** — TCP speed benchmark (built-in, integrated in `cmux_harness/iperf3/`)
 - **Auto-elevation** — automatic UAC admin privilege request for TUN adapter
 - **Tab completion** — AT command auto-completion and command history (requires `prompt_toolkit`)
+
+## Why This Tool?
+
+Testing LTE modules involves a chain of technologies — serial AT commands, CMUX multiplexing, PPP dialup, TUN virtual networking, and throughput measurement. Existing tools each cover only one or two links in this chain:
+
+| Tool                        | AT Commands | CMUX | PPP | TUN | FTP Test | iperf3 | Windows | Open Source |
+|-----------------------------|:-----------:|:----:|:---:|:---:|:--------:|:------:|:-------:|:-----------:|
+| **QCOM / QPST** (Qualcomm)  | ✅          | ✅   | ✅  | —   | —        | —      | ✅      | —           |
+| **ModemManager** (Linux)    | ✅          | ✅   | ✅  | —   | —        | —      | —       | ✅          |
+| **pppd**                    | —           | —    | ✅  | —   | —        | —      | —       | ✅          |
+| **AT Command Tester**       | ✅          | —    | —   | —   | —        | —      | ✅      | ✅          |
+| **iperf3** (standalone)     | —           | —    | —   | —   | —        | ✅     | ✅      | ✅          |
+| **Modem Harness**           | ✅          | ✅   | ✅  | ✅  | ✅       | ✅     | ✅      | ✅          |
+
+**What makes Modem Harness different:**
+
+- **Harness architecture — the killer feature.** Transport and application logic are completely decoupled. Each service (AT, PPP, ping, FTP, iperf3) is an independent plugin. Adding a new service requires **zero changes to existing code** — just one file, one `register()` call:
+
+  ```python
+  # That's it. Your new service gets AT commands, PPP events, TUN routing — all for free.
+  harness.register(MyCustomService())
+  ```
+
+  Want to add HTTP testing? MQTT benchmarking? DNS latency measurement? Write your service class, register it, done. No touching the core. This is the same plugin philosophy behind tools like Claude Code and VS Code extensions — the harness provides transport, events, and state; you focus on your application logic.
+
+- **Full-stack integration** — serial → CMUX → PPP → TUN → system TCP/IP, all in one tool. No need to chain 5 different programs together.
+- **Windows + pure Python** — Most LTE testing tools are either Linux-only (ModemManager, pppd) or closed-source vendor tools (QCOM). This runs on Windows with zero compilation — just Python 3.7+ and `pyserial`.
+- **Dual transport modes** — CMUX (GSM 07.10) and Direct Serial share the same service layer. Switch modes without restarting the program.
+- **Built-in benchmarking** — FTP upload/download speed tests and iperf3 TCP throughput benchmarks are integrated directly into the terminal, routing through the PPP/TUN link.
 
 ## Dual-Mode Design
 
@@ -39,27 +70,27 @@ The tool separates transport from application logic: CMUX and Direct Serial are 
 
 **When to use which:**
 
-| Scenario | Recommended mode |
-|---|---|
-| Concurrent AT + data on separate channels | CMUX |
-| Simple AT testing, quick debugging | Direct Serial |
-| Module doesn't support CMUX | Direct Serial |
-| Full PPP/FTP/iperf3 throughput testing | Either — both work |
+| Scenario                                      | Recommended mode |
+|-----------------------------------------------|------------------|
+| Concurrent AT + data on separate channels     | CMUX             |
+| Simple AT testing, quick debugging            | Direct Serial    |
+| Module doesn't support CMUX                   | Direct Serial    |
+| Full PPP/FTP/iperf3 throughput testing        | Either — both work |
 
 ## Quick Start
 
 ```bash
 # CMUX mode (default) — AT commands + PPP on separate DLCI channels
-python cmux_terminal.py COM11 115200 --frame-size 512
+python modem_harness.py COM11 115200 --frame-size 512
 
 # Direct Serial mode — all features available, no CMUX overhead
-python cmux_terminal.py COM11 115200 --serial
+python modem_harness.py COM11 115200 --serial
 
 # Interactive mode — select port, baud rate, frame size, and mode step by step
-python cmux_terminal.py
+python modem_harness.py
 ```
 
-If you double-click `cmux_terminal.py` in File Explorer, it will start in interactive mode
+If you double-click `modem_harness.py` in File Explorer, it will start in interactive mode
 and ask for the serial port, baud rate, CMUX frame size, and mode (CMUX or Direct Serial) step by step.
 
 Once connected:
@@ -83,28 +114,28 @@ Once connected:
 
 ## Commands
 
-| Command | Description |
-|---|---|
-| `at <cmd>` | Send AT command (DLCI 1 in CMUX mode, direct in serial mode) |
-| `1>AT+CSQ` | Send AT command on DLCI 1 (CMUX mode only) |
-| `2>AT+CGMI` | Send AT command on DLCI 2 (CMUX mode only) |
-| `ppp [dlci] [--apn APN]` | Start PPP dialup on given DLCI (default DLCI 2, no DLCI in serial mode) |
-| `ppp stop` | Stop PPP |
-| `ping [ip] [size]` | Ping target IP (default 8.8.8.8, 32B) |
-| `ftp upload <local> <remote>` | Upload file and measure speed |
-| `ftp download <remote> <local>` | Download file and measure speed |
-| `ftp config` | View/modify FTP server config |
-| `quit` | Exit |
+| Command                         | Description                                                                 |
+|---------------------------------|-----------------------------------------------------------------------------|
+| `at <cmd>`                      | Send AT command (DLCI 1 in CMUX mode, direct in serial mode)                |
+| `1>AT+CSQ`                      | Send AT command on DLCI 1 (CMUX mode only)                                  |
+| `2>AT+CGMI`                     | Send AT command on DLCI 2 (CMUX mode only)                                  |
+| `ppp [dlci] [--apn APN]`        | Start PPP dialup on given DLCI (default DLCI 2, no DLCI in serial mode)     |
+| `ppp stop`                      | Stop PPP                                                                    |
+| `ping [ip] [size]`              | Ping target IP (default 8.8.8.8, 32B)                                       |
+| `ftp upload <local> <remote>`   | Upload file and measure speed                                               |
+| `ftp download <remote> <local>` | Download file and measure speed                                             |
+| `ftp config`                    | View/modify FTP server config                                               |
+| `quit`                          | Exit                                                                        |
 
 ### CLI Options
 
-| Option | Description |
-|---|---|
-| `port` | Serial port (e.g. `COM11`). If omitted, prompts interactively. |
-| `baudrate` | Baud rate (default `115200`). |
-| `--verbose`, `-v` | Print raw serial data (hex dump). |
-| `--frame-size`, `-f` | CMUX max frame size N1 (default `0` = auto). |
-| `--serial` | Direct Serial PPP mode (skip CMUX, PPP runs directly on serial). |
+| Option               | Description                                                              |
+|----------------------|--------------------------------------------------------------------------|
+| `port`               | Serial port (e.g. `COM11`). If omitted, prompts interactively.           |
+| `baudrate`           | Baud rate (default `115200`).                                            |
+| `--verbose`, `-v`    | Print raw serial data (hex dump).                                        |
+| `--frame-size`, `-f` | CMUX max frame size N1 (default `0` = auto).                             |
+| `--serial`           | Direct Serial PPP mode (skip CMUX, PPP runs directly on serial).         |
 
 ## FTP Configuration
 
@@ -134,29 +165,29 @@ Configure it before first use:
 
 The TUN virtual adapter depends on [**wintun**](https://www.wintun.net/), a lightweight kernel-level TUN driver for Windows maintained by the WireGuard project.
 
-A **64-bit** `wintun.dll` (v0.14.1) is included in the project — no separate download needed. Place it alongside `cmux_terminal.py`:
+A **64-bit** `wintun.dll` (v0.14.1) is included in the project — no separate download needed. Place it alongside `modem_harness.py`:
 
 ```bash
 dir
-├── cmux_terminal.py
+├── modem_harness.py
 ├── wintun.dll      ← 64-bit, included
 ├── LICENSE
 └── README.md
 ```
 
-| | |
-|---|---|
-| **Official site** | https://www.wintun.net/ |
-| **Source code** | https://github.com/WireGuard/wintun |
-| **License** | MIT (same as this project) |
+|                   |                                          |
+|-------------------|------------------------------------------|
+| **Official site** | https://www.wintun.net/                  |
+| **Source code**   | https://github.com/WireGuard/wintun      |
+| **License**       | MIT (same as this project)               |
 
 > **Note:** If you need a 32-bit version, download `wintun-0.14.1.zip` from https://www.wintun.net/ and extract from the `x86` folder.
 
 ## Installation
 
 ```bash
-git clone https://github.com/<your-username>/cmux-terminal.git
-cd cmux-terminal
+git clone https://github.com/<your-username>/modem-harness.git
+cd modem-harness
 
 # Install required dependency
 pip install pyserial
@@ -167,11 +198,13 @@ pip install prompt_toolkit
 
 ## How It Works
 
+**CMUX mode** — GSM 07.10 multiplexing, AT and PPP on separate DLCI channels:
+
 ```
-┌─────────────┐    Serial     ┌──────────────┐
-│  LTE Module  │◄────────────►│  CMUX Engine  │
-│  (UE side)   │              │  (TE side)    │
-└─────────────┘              └──────┬───────┘
+┌─────────────┐    Serial     ┌─────────────┐
+│  LTE Module │◄────────────► │  CMUX Engine│
+│  (UE side)  │               │  (TE side)  │
+└─────────────┘               └─────┬───────┘
                                     │
                     ┌───────────────┼───────────────┐
                     │               │               │
@@ -179,12 +212,30 @@ pip install prompt_toolkit
               (Control)      (AT Commands)    (PPP Data)
                                                │
                                         ┌──────┴──────┐
-                                        │  PPP Engine  │
+                                        │  PPP Engine │
                                         └──────┬──────┘
                                                │
                                         ┌──────┴──────┐
-                                        │  TUN Adapter │──► System TCP/IP
+                                        │ TUN Adapter │──► System TCP/IP
                                         └─────────────┘
+```
+
+**Direct Serial mode** — raw serial, no CMUX overhead, PPP takes over the line:
+
+```
+┌─────────────┐    Serial     ┌──────────────────┐
+│  LTE Module │◄────────────► │ SerialTransport  │
+│  (UE side)  │               │  (raw serial)    │
+└─────────────┘               └────────┬─────────┘
+                                       │
+                           ┌───────────┴───────────┐
+                           │                       │
+                      PPP off:                 PPP on:
+                    AT Commands              PPP Engine
+                    (direct)                    │
+                                         ┌──────┴──────┐
+                                         │ TUN Adapter │──► System TCP/IP
+                                         └─────────────┘
 ```
 
 ## Harness Architecture — Adding New Services
@@ -195,38 +246,38 @@ The tool is built on a **harness architecture** that completely decouples transp
 
 ```
                         ┌──────────────────────────────────┐
-                        │         cmux_terminal.py          │
-                        │     (thin CLI entry, ~420 LOC)    │
+                        │         modem_harness.py         │
+                        │     (thin CLI entry, ~420 LOC)   │
                         └──────────────┬───────────────────┘
                                        │ register() x N
                                        ▼
 ┌──────────────────────────────────────────────────────────────────────┐
-│                           CmuxHarness                                 │
+│                           CmuxHarness                                │
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌───────────┐ │
 │  │  Transport   │  │   Services   │  │ SharedState  │  │ EventBus  │ │
 │  │  Interface   │  │   Registry   │  │ (thread-safe)│  │ (pub/sub) │ │
 │  └──────┬───────┘  └──────┬───────┘  └──────────────┘  └─────┬─────┘ │
-│         │                 │                                   │       │
-└─────────┼─────────────────┼───────────────────────────────────┼───────┘
-          │                 │                                   │
-          ▼                 ▼                                   ▼
+│         │                 │                                  │       │
+└─────────┼─────────────────┼──────────────────────────────────┼───────┘
+          │                 │                                  │
+          ▼                 ▼                                  ▼
 ┌───────────────────┐  ┌──────────────────────────────────────────────┐
-│ Transport Backend │  │              Service Layer                    │
+│ Transport Backend │  │              Service Layer                   │
 │                   │  │  ┌──────────┐ ┌──────────┐ ┌──────────┐      │
-│ ┌─────────────────┐│  │  │ AtService│ │PppService│ │FtpService│ ...  │
-│ │ CmuxTransport   ││  │  │ (AT cmd) │ │(LCP/IPCP │ │(FTP test)│      │
-│ │ (GSM 07.10)     ││  │  │          │ │ +TUN fwd)│ │          │      │
-│ └─────────────────┘│  │  └──────────┘ └──────────┘ └──────────┘      │
-│ ┌─────────────────┐│  │  ┌──────────┐ ┌──────────┐                  │
-│ │ SerialTransport ││  │  │PingSvc   │ │IperfSvc  │                  │
-│ │ (raw serial)    ││  │  │(sys ping)│ │(iperf3)  │                  │
-│ └─────────────────┘│  │  └──────────┘ └──────────┘                  │
+│ ┌────────────────┐│  │  │ AtService│ │PppService│ │FtpService│ ...  │
+│ │ CmuxTransport  ││  │  │ (AT cmd) │ │(LCP/IPCP │ │(FTP test)│      │
+│ │ (GSM 07.10)    ││  │  │          │ │ +TUN fwd)│ │          │      │
+│ └────────────────┘│  │  └──────────┘ └──────────┘ └──────────┘      │
+│ ┌────────────────┐│  │  ┌──────────┐ ┌──────────┐                   │
+│ │ SerialTransport││  │  │PingSvc   │ │IperfSvc  │                   │
+│ │ (raw serial)   ││  │  │(sys ping)│ │(iperf3)  │                   │
+│ └────────────────┘│  │  └──────────┘ └──────────┘                   │
 └───────────────────┘  └──────────────────────────────────────────────┘
           │                                   │
           ▼                                   ▼
    ┌─────────────┐                    ┌──────────────┐
-   │  LTE Module  │                    │  TUN Adapter │──► System TCP/IP
-   │  (serial)    │                    │  (wintun)    │
+   │  LTE Module │                    │  TUN Adapter │──► System TCP/IP
+   │  (serial)   │                    │  (wintun)    │
    └─────────────┘                    └──────────────┘
 
    Services communicate ONLY through EventBus — never directly.
@@ -266,13 +317,13 @@ class MyService(ServiceInterface):
 
 Services communicate through the event bus — they never reference each other directly:
 
-| Event | When | Data |
-|---|---|---|
-| `PPP_IPCP_UP` | PPP negotiation completes | `local_ip`, `remote_ip`, `dns` |
-| `PPP_DISCONNECTING` | PPP is about to disconnect | — |
-| `PPP_ICMP_REPLY` | ICMP echo reply received | `icmp`, `src`, `ttl` |
-| `TRANSPORT_OPENED` | Transport is ready | `mode` |
-| `TRANSPORT_CLOSED` | Transport is shutting down | — |
+| Event                  | When                            | Data                              |
+|------------------------|---------------------------------|-----------------------------------|
+| `PPP_IPCP_UP`          | PPP negotiation completes       | `local_ip`, `remote_ip`, `dns`   |
+| `PPP_DISCONNECTING`    | PPP is about to disconnect      | —                                 |
+| `PPP_ICMP_REPLY`       | ICMP echo reply received        | `icmp`, `src`, `ttl`              |
+| `TRANSPORT_OPENED`     | Transport is ready              | `mode`                            |
+| `TRANSPORT_CLOSED`     | Transport is shutting down      | —                                 |
 
 ### Example: Registering the FTP Service
 
@@ -311,10 +362,10 @@ class FtpService(ServiceInterface):
     def on_shutdown(self):        pass
 ```
 
-Then register it in `cmux_terminal.py`:
+Then register it in `modem_harness.py`:
 
 ```python
-# In cmux_terminal.py:
+# In modem_harness.py:
 from cmux_harness.services.ftp import FtpService
 
 # ... in the harness setup section:
@@ -358,7 +409,7 @@ cmux_harness/
 ### "WintunCreateAdapter failed"
 
 1. Make sure you are running as **Administrator** (right-click → Run as administrator).
-2. Verify `wintun.dll` is in the same directory as `cmux_terminal.py` (it is included in the project by default).
+2. Verify `wintun.dll` is in the same directory as `modem_harness.py` (it is included in the project by default).
 3. If you're on 32-bit Windows, download the x86 version from https://www.wintun.net/.
 
 ### "Access denied" / UAC prompt cancelled

@@ -31,7 +31,7 @@ class TunAdapter:
         self._dll = None
         self._read_event = None
         self._running = False
-        self._adapter_name = 'LTEcat1_TUN'
+        self._adapter_name = 'Modem_TUN'
 
     def _load_dll(self):
         """load wintun.dll (supports PyInstaller bundle and local run)"""

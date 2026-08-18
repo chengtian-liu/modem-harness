@@ -35,4 +35,5 @@ class UdpTestProtocol(asyncio.DatagramProtocol):
         """
         Write data to transport.
         """
-        self._transport.sendto(data)
+        if self._transport and not self._transport.is_closing():
+            self._transport.sendto(data)
