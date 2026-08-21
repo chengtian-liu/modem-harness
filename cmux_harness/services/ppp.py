@@ -110,7 +110,7 @@ class PppService(ServiceInterface):
         return None
 
     def on_shutdown(self) -> None:
-        self.stop()
+        self.stop(fast=True)
 
     # ---- Public API ----
 
@@ -176,11 +176,11 @@ class PppService(ServiceInterface):
         )
         self._ppp_thread.start()
 
-    def stop(self) -> None:
+    def stop(self, fast=False) -> None:
         if self._running:
-            print(f"\n  [PPP] stopping...")
+            print(f"\n  [PPP] stopping{' (fast)' if fast else ''}...")
             self._harness.transport.dialing = True
-            self._disconnect()
+            self._disconnect(fast=fast)
             self._running = False
             if self._ppp_thread:
                 self._ppp_thread.join(timeout=5)
@@ -629,13 +629,13 @@ class PppService(ServiceInterface):
             print(f"  [TUN] creation failed: {e}")
             self._tun = None
 
-    def _stop_tun(self):
+    def _stop_tun(self, fast=False):
         if self._tun:
-            if self._current_ftp_route:
+            if self._current_ftp_route and not fast:
                 self._tun_del_route(self._current_ftp_route)
             self._tun._running = False
             if self._tun_thread:
-                self._tun_thread.join(timeout=2)
+                self._tun_thread.join(timeout=1 if fast else 2)
             self._tun.close()
             self._tun = None
             self._tun_thread = None
@@ -764,38 +764,42 @@ class PppService(ServiceInterface):
                 time.sleep(0.05)
         return False
 
-    def _disconnect(self):
+    def _disconnect(self, fast=False):
         self._harness.events.fire(Event.PPP_DISCONNECTING)
 
-        self._stop_tun()
+        self._stop_tun(fast=fast)
 
         if self._lcp_up:
             self._send_lcp_term_req()
-            deadline = time.time() + 3.0
-            while self._lcp_up and time.time() < deadline:
-                transport = self._harness.transport
-                raw = transport.serial_port.read(transport.serial_port.in_waiting or 1)
-                if raw:
-                    if self._harness.state.mode == 'serial':
-                        self._parser.feed(raw)
+            if fast:
+                time.sleep(0.3)
+            else:
+                deadline = time.time() + 3.0
+                while self._lcp_up and time.time() < deadline:
+                    transport = self._harness.transport
+                    raw = transport.serial_port.read(transport.serial_port.in_waiting or 1)
+                    if raw:
+                        if self._harness.state.mode == 'serial':
+                            self._parser.feed(raw)
+                        else:
+                            transport.cmux.parser.feed(raw)
+                            while True:
+                                frame = transport.cmux.parser.get_frame()
+                                if frame is None:
+                                    break
+                                if frame['dlci'] == self._harness.state.ppp_dlci and frame['type'] == FrameType.UIH:
+                                    if frame['info']:
+                                        self._parser.feed(frame['info'])
                     else:
-                        transport.cmux.parser.feed(raw)
-                        while True:
-                            frame = transport.cmux.parser.get_frame()
-                            if frame is None:
-                                break
-                            if frame['dlci'] == self._harness.state.ppp_dlci and frame['type'] == FrameType.UIH:
-                                if frame['info']:
-                                    self._parser.feed(frame['info'])
-                else:
-                    time.sleep(0.05)
-            if not self._lcp_up:
-                print(f"  [PPP] LCP disconnected ✓")
+                        time.sleep(0.05)
+                if not self._lcp_up:
+                    print(f"  [PPP] LCP disconnected ✓")
 
-        time.sleep(1.0)
+        time.sleep(0.3 if fast else 1.0)
         transport = self._harness.transport
         state = self._harness.state
 
+        # +++ to exit transparent mode (must wait before ATH)
         if state.mode == 'serial':
             transport.serial_port.write(b'+++\r')
             print(f"  [PPP] → +++")
@@ -803,17 +807,21 @@ class PppService(ServiceInterface):
             transport.send(b'+++', state.ppp_dlci)
             print(f"  [PPP] → +++ (CMUX UIH)")
 
-        time.sleep(1.0)
-        if not self._read_cmux_until(['NO CARRIER'], timeout=10.0):
-            print(f"  [PPP] NO CARRIER not received, continuing...")
+        time.sleep(0.5 if fast else 1.0)
 
+        if not fast:
+            if not self._read_cmux_until(['NO CARRIER'], timeout=10.0):
+                print(f"  [PPP] NO CARRIER not received, continuing...")
+
+        # ATH to hang up
         time.sleep(0.1)
         if state.mode == 'serial':
             transport.serial_port.write(b'ATH\r')
         else:
             transport.send(b'ATH\r', state.ppp_dlci)
-        self._read_cmux_until(['OK'], timeout=5.0)
+        self._read_cmux_until(['OK'], timeout=2.0 if fast else 5.0)
 
+        # AT to verify command mode
         time.sleep(0.1)
         if state.mode == 'serial':
             transport.serial_port.write(b'AT\r')
@@ -821,25 +829,26 @@ class PppService(ServiceInterface):
             transport.send(b'AT\r', state.ppp_dlci)
         self._read_cmux_until(['OK'], timeout=2.0)
 
-        time.sleep(0.1)
-        if state.mode == 'serial':
-            transport.serial_port.write(b'ATE0V1\r')
-        else:
-            transport.send(b'ATE0V1\r', state.ppp_dlci)
-        self._read_cmux_until(['OK'], timeout=2.0)
+        if not fast:
+            time.sleep(0.1)
+            if state.mode == 'serial':
+                transport.serial_port.write(b'ATE0V1\r')
+            else:
+                transport.send(b'ATE0V1\r', state.ppp_dlci)
+            self._read_cmux_until(['OK'], timeout=2.0)
 
-        time.sleep(0.1)
-        if state.mode == 'serial':
-            transport.serial_port.write(b'AT\r')
-        else:
-            transport.send(b'AT\r', state.ppp_dlci)
-        self._read_cmux_until(['OK'], timeout=2.0)
+            time.sleep(0.1)
+            if state.mode == 'serial':
+                transport.serial_port.write(b'AT\r')
+            else:
+                transport.send(b'AT\r', state.ppp_dlci)
+            self._read_cmux_until(['OK'], timeout=2.0)
 
-        time.sleep(0.1)
-        if state.mode == 'serial':
-            transport.serial_port.write(b'ATS0=0\r')
-        else:
-            transport.send(b'ATS0=0\r', state.ppp_dlci)
+            time.sleep(0.1)
+            if state.mode == 'serial':
+                transport.serial_port.write(b'ATS0=0\r')
+            else:
+                transport.send(b'ATS0=0\r', state.ppp_dlci)
 
         print(f"  [PPP] disconnect sequence complete ✓")
         self._harness.events.fire(Event.PPP_DISCONNECTED)

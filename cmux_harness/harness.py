@@ -132,10 +132,19 @@ class CmuxHarness:
         return True
 
     def shutdown(self) -> None:
-        """Shutdown all services and close transport."""
+        """Shutdown all services and close transport.
+
+        Order matters:
+          1. Stop reader first — services (PPP disconnect) need exclusive serial access
+          2. Shutdown services — PPP can use serial port without reader contention
+          3. Close transport — CmuxTE sends CLD to exit CMUX, then closes port
+        """
         self._running = False
 
         self.events.fire(Event.TRANSPORT_CLOSED)
+
+        # Stop reader first so services get exclusive serial access
+        self.transport.stop_reader()
 
         for name in reversed(self._service_order):
             service = self._services[name]
@@ -144,7 +153,6 @@ class CmuxHarness:
             except Exception as e:
                 print(f"  [Harness] error shutting down service '{name}': {e}")
 
-        self.transport.stop_reader()
         self.transport.close()
 
     @property

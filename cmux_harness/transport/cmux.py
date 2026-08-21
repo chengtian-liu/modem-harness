@@ -42,9 +42,31 @@ class CmuxTE:
         print(f"[Serial] {port} opened, baudrate={baudrate}")
 
     def close(self):
+        """Exit CMUX mode on modem, then close serial port.
+
+        Uses CLD (Close Down) — the standard GSM 07.10 command to shut down
+        the entire multiplexer and return the modem to AT command mode.
+        """
         if self.dlc_available[0]:
-            self.send_raw(make_disc(0))
-            time.sleep(0.5)
+            # Step 1: Send CLD to shut down CMUX multiplexer
+            print("[CMUX] Sending CLD (Close Down)...")
+            self.send_raw(make_cld())
+            time.sleep(0.3)
+
+            # Step 2: Verify modem returned to AT command mode
+            print("[CMUX] Verifying AT command mode...")
+            self.ser.reset_input_buffer()
+            self.send_at("AT")
+            deadline = time.time() + 1.0
+            while time.time() < deadline:
+                raw = self.ser.read(self.ser.in_waiting or 1)
+                if raw and b"OK" in raw:
+                    print("[CMUX] ✓ Modem returned to AT command mode")
+                    break
+                time.sleep(0.05)
+            else:
+                print("[CMUX] ⚠ No AT response after CLD")
+
         if self.ser and self.ser.is_open:
             self.ser.close()
             print(f"[Serial] {self.ser.port} closed")
