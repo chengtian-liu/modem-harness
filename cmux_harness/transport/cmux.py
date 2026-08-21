@@ -9,6 +9,8 @@ import serial
 from ..protocol.cmux import (
     FrameParser, FrameType, CtrlType,
     make_sabm, make_disc, make_uih_cmd, make_cld,
+    make_msc_resp, make_msc_cmd, make_msc_fc,
+    SIGNAL_FC, decode_signals,
 )
 
 
@@ -24,6 +26,7 @@ class CmuxTE:
         self.ser = None
         self.parser = FrameParser()
         self.dlc_available = {0: False, 1: False, 2: False}
+        self.frame_allowed = {1: True, 2: True}  # MSC flow control: assume allowed until told otherwise
         self.running = False
         self.lock = threading.Lock()
 
@@ -95,6 +98,64 @@ class CmuxTE:
         else:
             print(f"  [Failed] received unknown response type=0x{frame['type']:02X}")
             return False
+
+    # ---- MSC (Modem Status Command) handling ----
+
+    def _parse_msc(self, info: bytes) -> tuple:
+        """Parse MSC information field.
+
+        Returns (dlci, signals, is_command).
+        """
+        dlci = (info[2] & 0xFC) >> 2
+        signals = info[3] if len(info) > 3 else 0
+        is_command = bool(info[0] & 0x02)  # C/R bit
+        return dlci, signals, is_command
+
+    def _handle_msc(self, frame: dict):
+        """Process incoming MSC on DLCI 0."""
+        info = frame['info']
+        if len(info) < 4:
+            return
+
+        dlci, signals, is_command = self._parse_msc(info)
+
+        if is_command:
+            # Update flow control state for this DLCI
+            fc_set = bool(signals & SIGNAL_FC)
+            old_allowed = self.frame_allowed.get(dlci, True)
+            self.frame_allowed[dlci] = not fc_set
+
+            sig_desc = decode_signals(signals)
+            if old_allowed != (not fc_set):
+                action = 'BLOCKED' if fc_set else 'ALLOWED'
+                print(f"  [MSC] DLCI {dlci}: FC={'on' if fc_set else 'off'} "
+                      f"({sig_desc}) → {action}")
+            else:
+                print(f"  [MSC] DLCI {dlci}: {sig_desc}")
+
+            # Acknowledge — respond with C/R cleared, preserve P/F
+            if self.ser and self.ser.is_open:
+                pf = frame.get('pf', 0)
+                resp = make_msc_resp(info, pf=pf)
+                self.send_raw(resp)
+        else:
+            # ACK for our MSC command
+            sig_desc = decode_signals(signals)
+            print(f"  [MSC ACK] DLCI {dlci}: {sig_desc}")
+
+    def send_msc(self, dlci: int, fc_on: bool):
+        """Send MSC command to modem to set flow control on a DLCI.
+
+        Args:
+            dlci:  Channel number.
+            fc_on: True = tell modem to stop sending (FC=1),
+                   False = allow modem to send (FC=0).
+        """
+        frame = make_msc_fc(dlci, fc_on)
+        if self.ser and self.ser.is_open:
+            self.send_raw(frame)
+            action = 'stop' if fc_on else 'resume'
+            print(f"  [MSC TX] DLCI {dlci}: telling modem to {action} sending")
 
     def init_cmux(self) -> bool:
         print("\n" + "=" * 60)
@@ -179,6 +240,11 @@ class CmuxTE:
         print(f"  DLCI 0: {'✓' if self.dlc_available[0] else '✗'}")
         print(f"  DLCI 1: {'✓' if self.dlc_available[1] else '✗'}")
         print(f"  DLCI 2: {'✓' if self.dlc_available[2] else '✗'}")
+        fc_status = ', '.join(
+            f"DLCI {d}: {'allowed' if a else 'blocked'}"
+            for d, a in self.frame_allowed.items()
+        )
+        print(f"  MSC flow control: {fc_status}")
         print("=" * 60)
         return True
 
@@ -209,6 +275,10 @@ class CmuxTransport:
         self._cmux.close()
 
     def send(self, data: bytes, dlci: int = 0) -> None:
+        # Check MSC flow control — modem may have told us to stop sending
+        if dlci > 0 and not self._cmux.frame_allowed.get(dlci, True):
+            print(f"  [Flow Control] DLCI {dlci} blocked by MSC, frame not sent")
+            return
         self._cmux.send_uih(dlci, data)
 
     def start_reader(self, on_frame: Callable[[int, bytes], None]) -> None:
@@ -285,6 +355,12 @@ class CmuxTransport:
         if dlci == 0:
             if info:
                 ctrl_type = info[0] & 0xEF if info else 0
+
+                # Handle MSC (Modem Status Command) — flow control
+                if ctrl_type == CtrlType.MSC:
+                    self._cmux._handle_msc(frame)
+                    return
+
                 type_names = {
                     CtrlType.CLD: 'CLD', CtrlType.TEST: 'TEST',
                     CtrlType.FCON: 'FCON', CtrlType.FCOFF: 'FCOFF',

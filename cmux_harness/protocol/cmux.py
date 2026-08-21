@@ -32,7 +32,30 @@ class CtrlType(IntEnum):
     NSC   = 0x11   # Non Supported Command
 
 
-# FCS CRC-8 lookup table, poly=0x07, reversed
+# ============================================================
+# V.24 signal bits (used in MSC — Modem Status Command)
+# ============================================================
+
+SIGNAL_FC  = 0x02   # Flow Control  — set = "do not send frames"
+SIGNAL_RTC = 0x04   # Ready To Communicate
+SIGNAL_RTR = 0x08   # Ready To Receive
+SIGNAL_IC  = 0x40   # Incoming Call (Ring Indicator)
+SIGNAL_DV  = 0x80   # Data Valid
+SIGNAL_EA  = 0x01   # Extension bit (always set in V.24 signals)
+
+# Human-readable names for logging
+SIGNAL_NAMES = [
+    (SIGNAL_FC, 'FC'), (SIGNAL_RTC, 'RTC'), (SIGNAL_RTR, 'RTR'),
+    (SIGNAL_IC, 'IC'), (SIGNAL_DV, 'DV'),
+]
+
+
+def decode_signals(signals: int) -> str:
+    """Decode V.24 signal byte to human-readable string."""
+    return '|'.join(n for b, n in SIGNAL_NAMES if signals & b) or 'none'
+
+
+# CRC table, poly=0x07, reversed
 CRC_TABLE = [
     0x00, 0x91, 0xE3, 0x72, 0x07, 0x96, 0xE4, 0x75,
     0x0E, 0x9F, 0xED, 0x7C, 0x09, 0x98, 0xEA, 0x7B,
@@ -94,8 +117,8 @@ def make_frame(dlci: int, cr: int, frame_type: int, pf: int, data: bytes = b'') 
 
     if length > 127:
         len_bytes = bytes([
-            ((length & 0x7F) << 1) | 0,
-            (length >> 7) & 0xFF
+            (length & 0x7F) << 1,      # lower 7 bits, EA=0 (more bytes follow)
+            (length >> 7),             # upper bits, no EA (C-compatible)
         ])
     else:
         len_bytes = bytes([(length << 1) | 1])
@@ -136,6 +159,52 @@ def make_cld() -> bytes:
 
 
 # ============================================================
+# MSC (Modem Status Command) frame builders
+# ============================================================
+
+def make_msc_info(dlci: int, signals: int) -> bytes:
+    """Build MSC information field: [dlci_addr(EA=1,CR=1), signals]."""
+    return bytes([(dlci << 2) | CR_BIT | EA, signals])
+
+
+def make_msc_cmd(dlci: int, signals: int) -> bytes:
+    """Build MSC command frame (TE→UE, C/R=1)."""
+    info = make_msc_info(dlci, signals)
+    msg = bytes([CtrlType.MSC | CR_BIT, (len(info) << 1) | EA]) + info
+    return make_uih_cmd(0, msg)
+
+
+def make_msc_resp(info: bytes, pf: int = 0) -> bytes:
+    """Build MSC response frame (C/R cleared in info[0], send as UIH on DLCI 0).
+
+    This matches the C code behavior: the info field is sent directly as the
+    UIH payload, with only the C/R bit cleared. No extra MSC header is added.
+
+    Args:
+        info: Original MSC info field from the modem's command.
+              info[0] has C/R=1; this function clears it for the response.
+        pf:   P/F bit — set to 1 if the modem's command had P/F=1.
+    """
+    resp = bytearray(info)
+    resp[0] = resp[0] & ~CR_BIT  # clear C/R → response
+    return make_frame(0, cr=1, frame_type=FrameType.UIH, pf=pf, data=bytes(resp))
+
+
+def make_msc_fc(dlci: int, fc_on: bool) -> bytes:
+    """Build MSC command to set flow control on a specific DLCI.
+
+    Args:
+        dlci:  Channel number.
+        fc_on: True = tell modem to stop sending (FC=1),
+               False = allow modem to send (FC=0).
+    """
+    signals = SIGNAL_EA
+    if fc_on:
+        signals |= SIGNAL_FC
+    return make_msc_cmd(dlci, signals)
+
+
+# ============================================================
 # CMUX frame parser
 # ============================================================
 
@@ -163,6 +232,7 @@ class FrameParser:
             while start < len(self.buffer) and self.buffer[start] == CMUX_FLAG:
                 start += 1
 
+            # Minimum header: addr(1) + ctrl(1) + len(1) + fcs(1) + end_flag(1) = 5
             if len(self.buffer) - start < 5:
                 break
 
@@ -177,20 +247,24 @@ class FrameParser:
             pf = (ctrl & 0x10) >> 4
             frame_type = ctrl & 0xEF
 
+            # Parse length field — check EA bit BEFORE advancing pos
             length = (self.buffer[pos] & 0xFE) >> 1
             ea_len = self.buffer[pos] & 0x01
-            pos += 1
             if ea_len == 0:
-                if pos >= len(self.buffer):
+                # 2-byte length: need addr(1) + ctrl(1) + len(2) + fcs(1) + end(1) = 6
+                if len(self.buffer) - start < 6:
                     break
-                length += self.buffer[pos] * 128
                 pos += 1
+                # byte 2 value directly * 128 (matches C code: *local_readp*128)
+                length += self.buffer[pos] * 128
+            pos += 1
 
-            total_len = (pos - start) + length + 2
-            if len(self.buffer) - start < total_len:
+            # Need remaining: payload(length) + fcs(1) + end_flag(1)
+            if len(self.buffer) - pos < length + 2:
                 break
 
             info = bytes(self.buffer[pos:pos + length])
+            header_end = pos  # position right after length field(s)
             pos += length
 
             fcs_byte = self.buffer[pos]; pos += 1
@@ -198,8 +272,10 @@ class FrameParser:
 
             frame_raw = bytes(self.buffer[start:pos])
 
+            # Extract header + length bytes for FCS verification
+            # header = addr + ctrl, len_bytes = everything from length field start to header_end
             header = bytes([addr, ctrl])
-            len_bytes = frame_raw[2:pos - start - length - 2]
+            len_bytes = frame_raw[2:(header_end - start)]
             expected_fcs = cmux_fcs(header + len_bytes)
 
             if end_flag != CMUX_FLAG:
