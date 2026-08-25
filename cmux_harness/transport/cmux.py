@@ -15,8 +15,12 @@ from ..protocol.cmux import (
 
 
 # Max frames to batch before forcing a serial write
-# (mirrors QUECTEL_CACHE_FRAMES in gsm0710muxd_bp.c)
 CACHE_FRAMES = 20
+
+# How long send() waits while a DLCI is flow-control blocked before giving
+# up and dropping the frame. The C muxer waits indefinitely; an interactive
+# tool bounds it so a stuck link cannot hang the sender forever.
+FC_WAIT_TIMEOUT = 5.0
 
 
 # ============================================================
@@ -34,7 +38,12 @@ class CmuxTE:
         self.frame_allowed = {1: True, 2: True}  # MSC flow control: assume allowed until told otherwise
         self.running = False
         self.lock = threading.Lock()
-        # Write batching (mirrors C serial_device_write): full-size data
+        # MSC flow control: senders block on this condition while a DLCI is
+        # FC-blocked; _handle_msc notifies when the modem re-allows it.
+        self._fc_cond = threading.Condition()
+        # Frames dropped after FC_WAIT_TIMEOUT while a DLCI stayed blocked
+        self.fc_drop_count = 0
+        # Write batching: full-size data
         # frames accumulate here until a small frame arrives or the cache
         # reaches CACHE_FRAMES, then everything goes out in one write().
         self._write_cache = bytearray()
@@ -95,8 +104,8 @@ class CmuxTE:
     def send_raw(self, data: bytes):
         """Queue a frame for transmission, batching consecutive frames.
 
-        Mirrors serial_device_write() in gsm0710muxd_bp.c: frames accumulate
-        in the write cache and go out in a single serial write when either
+        Frames accumulate in the write cache and go out in a single serial
+        write when either
         - the frame is smaller than a full-size frame (control frames and
           packet-tail fragments must not be delayed), or
         - CACHE_FRAMES full-size frames have accumulated.
@@ -188,7 +197,11 @@ class CmuxTE:
             # Update flow control state for this DLCI
             fc_set = bool(signals & SIGNAL_FC)
             old_allowed = self.frame_allowed.get(dlci, True)
-            self.frame_allowed[dlci] = not fc_set
+            with self._fc_cond:
+                self.frame_allowed[dlci] = not fc_set
+                if not fc_set:
+                    # Channel re-allowed — wake senders blocked in send()
+                    self._fc_cond.notify_all()
 
             sig_desc = decode_signals(signals)
             if old_allowed != (not fc_set):
@@ -340,11 +353,25 @@ class CmuxTransport:
         self._cmux.close()
 
     def send(self, data: bytes, dlci: int = 0) -> None:
-        # Check MSC flow control — modem may have told us to stop sending
-        if dlci > 0 and not self._cmux.frame_allowed.get(dlci, True):
-            print(f"  [Flow Control] DLCI {dlci} blocked by MSC, frame not sent")
-            return
-        self._cmux.send_uih(dlci, data)
+        # MSC flow control: if the modem told us to stop (FC=1), wait for
+        # the channel to be re-allowed instead of dropping the frame.
+        # Senders stall here, so nothing is read out of the upstream buffer
+        # (wintun) and backpressure propagates to the IP stack — the same
+        # strategy as the C muxer, which stops reading a blocked channel.
+        te = self._cmux
+        if dlci > 0 and not te.frame_allowed.get(dlci, True):
+            deadline = time.time() + FC_WAIT_TIMEOUT
+            with te._fc_cond:
+                while not te.frame_allowed.get(dlci, True):
+                    remaining = deadline - time.time()
+                    if remaining <= 0:
+                        te.fc_drop_count += 1
+                        print(f"  [Flow Control] DLCI {dlci} blocked for "
+                              f"{FC_WAIT_TIMEOUT:.0f}s, frame dropped "
+                              f"(total dropped: {te.fc_drop_count})")
+                        return
+                    te._fc_cond.wait(remaining)
+        te.send_uih(dlci, data)
 
     def start_reader(self, on_frame: Callable[[int, bytes], None]) -> None:
         self._on_frame = on_frame
