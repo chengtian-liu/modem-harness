@@ -14,6 +14,11 @@ from ..protocol.cmux import (
 )
 
 
+# Max frames to batch before forcing a serial write
+# (mirrors QUECTEL_CACHE_FRAMES in gsm0710muxd_bp.c)
+CACHE_FRAMES = 20
+
+
 # ============================================================
 # CMUX TE controller
 # ============================================================
@@ -29,6 +34,11 @@ class CmuxTE:
         self.frame_allowed = {1: True, 2: True}  # MSC flow control: assume allowed until told otherwise
         self.running = False
         self.lock = threading.Lock()
+        # Write batching (mirrors C serial_device_write): full-size data
+        # frames accumulate here until a small frame arrives or the cache
+        # reaches CACHE_FRAMES, then everything goes out in one write().
+        self._write_cache = bytearray()
+        self._cache_frames = 0
 
     def open(self, port: str, baudrate: int):
         self.ser = serial.Serial(
@@ -71,10 +81,43 @@ class CmuxTE:
             self.ser.close()
             print(f"[Serial] {self.ser.port} closed")
 
+    @property
+    def _full_frame_size(self) -> int:
+        """Wire size of a full-size UIH frame (payload == N1).
+
+        Overhead is flag+addr+ctrl+len(1 or 2)+fcs+flag = 6 bytes when
+        N1 <= 127 (1-byte length), 7 bytes when N1 > 127 (2-byte length).
+        Matches cmux_FRAME in the C code (N1=127 → 133).
+        """
+        n1 = self.frame_size if self.frame_size > 0 else 127
+        return n1 + (7 if n1 > 127 else 6)
+
     def send_raw(self, data: bytes):
+        """Queue a frame for transmission, batching consecutive frames.
+
+        Mirrors serial_device_write() in gsm0710muxd_bp.c: frames accumulate
+        in the write cache and go out in a single serial write when either
+        - the frame is smaller than a full-size frame (control frames and
+          packet-tail fragments must not be delayed), or
+        - CACHE_FRAMES full-size frames have accumulated.
+
+        Bulk transfers (PPP over TUN) are runs of full-size frames ending
+        in a short tail, so each packet naturally drains in one write().
+        """
         with self.lock:
-            self.ser.write(data)
-            self.ser.flush()
+            self._write_cache.extend(data)
+            self._cache_frames += 1
+            if len(data) < self._full_frame_size or self._cache_frames >= CACHE_FRAMES:
+                self._flush_cache_locked()
+
+    def _flush_cache_locked(self):
+        """Write all cached frames out in one go. Caller must hold self.lock."""
+        if not self._write_cache:
+            return
+        self.ser.write(bytes(self._write_cache))
+        self.ser.flush()
+        self._write_cache.clear()
+        self._cache_frames = 0
 
     def send_at(self, cmd: str):
         self.send_raw((cmd + '\r').encode())
