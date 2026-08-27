@@ -118,7 +118,7 @@ def make_frame(dlci: int, cr: int, frame_type: int, pf: int, data: bytes = b'') 
     if length > 127:
         len_bytes = bytes([
             (length & 0x7F) << 1,      # lower 7 bits, EA=0 (more bytes follow)
-            (length >> 7),             # upper bits, no EA (C-compatible)
+            (length >> 7),             # upper bits, no EA
         ])
     else:
         len_bytes = bytes([(length << 1) | 1])
@@ -158,6 +158,28 @@ def make_cld() -> bytes:
     return make_uih_cmd(0, msg)
 
 
+def make_test(payload: bytes = b'PING\r\n') -> bytes:
+    """build TEST command frame (TE→UE keepalive probe on DLCI 0)
+
+    Info field layout: [TEST|C/R, length(EA=1), payload]. The UE should
+    echo the payload back as a TEST response; any frame at all coming back
+    proves it is alive.
+    """
+    msg = bytes([CtrlType.TEST | CR_BIT, (len(payload) << 1) | EA]) + payload
+    return make_uih_cmd(0, msg)
+
+
+def make_test_resp(info: bytes, pf: int = 0) -> bytes:
+    """Build TEST response when the modem probes *us*.
+
+    Echo the info field back with only the C/R bit cleared (same pattern as
+    make_msc_resp), so the modem sees its payload answered.
+    """
+    resp = bytearray(info)
+    resp[0] = resp[0] & ~CR_BIT  # clear C/R → response
+    return make_frame(0, cr=1, frame_type=FrameType.UIH, pf=pf, data=bytes(resp))
+
+
 # ============================================================
 # MSC (Modem Status Command) frame builders
 # ============================================================
@@ -177,8 +199,8 @@ def make_msc_cmd(dlci: int, signals: int) -> bytes:
 def make_msc_resp(info: bytes, pf: int = 0) -> bytes:
     """Build MSC response frame (C/R cleared in info[0], send as UIH on DLCI 0).
 
-    This matches the C code behavior: the info field is sent directly as the
-    UIH payload, with only the C/R bit cleared. No extra MSC header is added.
+    The info field is sent directly as the UIH payload, with only the C/R
+    bit cleared. No extra MSC header is added.
 
     Args:
         info: Original MSC info field from the modem's command.
@@ -255,7 +277,7 @@ class FrameParser:
                 if len(self.buffer) - start < 6:
                     break
                 pos += 1
-                # byte 2 value directly * 128 (matches C code: *local_readp*128)
+                # byte 2 value directly * 128
                 length += self.buffer[pos] * 128
             pos += 1
 

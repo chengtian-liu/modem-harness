@@ -3,6 +3,7 @@
 from .harness import CmuxHarness
 from .state import SharedState
 from .events import Event, EventBus
+from .transport.cmux import DEFAULT_KEEPALIVE_INTERVAL
 from .services.base import ServiceInterface
 from .services.at import AtService, AtChannel
 from .services.ppp import PppService
@@ -15,6 +16,7 @@ __all__ = [
     'SharedState',
     'Event',
     'EventBus',
+    'DEFAULT_KEEPALIVE_INTERVAL',
     'ServiceInterface',
     'AtService',
     'AtChannel',

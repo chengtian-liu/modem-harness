@@ -8,11 +8,11 @@ from .state import SharedState
 from .events import Event, EventBus
 from .transport.base import TransportInterface
 from .transport.serial import SerialTransport
-from .transport.cmux import CmuxTransport
+from .transport.cmux import CmuxTransport, DEFAULT_KEEPALIVE_INTERVAL
 from .services.base import ServiceInterface
 from .services.at import AtService, AtChannel
 from .services.ppp import PppService
-from .protocol.cmux import CtrlType
+from .protocol.cmux import CtrlType, CR_BIT
 
 
 class CmuxHarness:
@@ -27,7 +27,8 @@ class CmuxHarness:
         6. harness.shutdown()
     """
 
-    def __init__(self, mode: str = 'cmux', verbose: bool = False, frame_size: int = 0):
+    def __init__(self, mode: str = 'cmux', verbose: bool = False, frame_size: int = 0,
+                 keepalive: float = DEFAULT_KEEPALIVE_INTERVAL):
         self._mode = mode
         self._verbose = verbose
         self._frame_size = frame_size
@@ -45,8 +46,13 @@ class CmuxHarness:
             self.transport: TransportInterface = SerialTransport(verbose=verbose)
         else:
             self.transport: TransportInterface = CmuxTransport(
-                frame_size=frame_size, verbose=verbose
+                frame_size=frame_size, verbose=verbose, keepalive=keepalive
             )
+            # Keepalive hooks: when the transport declares the CMUX link dead,
+            # tear down link-dependent services; when it recovers, mark the
+            # transport ready again.
+            self.transport.on_link_down = self._on_link_down
+            self.transport.on_link_recovered = self._on_link_recovered
 
         # AT service (special — always present, needed for frame routing)
         self._at_service: Optional[AtService] = None
@@ -158,6 +164,29 @@ class CmuxHarness:
     @property
     def running(self) -> bool:
         return self._running
+
+    # ---- Keepalive hooks (CMUX mode) ----
+
+    def _on_link_down(self):
+        """Transport declared the CMUX link dead — clean up link-dependent services.
+
+        Called from the keepalive thread, before link recovery starts. PPP
+        cannot survive a mux reset, so it is torn down fast (no serial
+        interaction — the link is presumed dead anyway).
+        """
+        print("\n  [Harness] CMUX link lost — cleaning up services...")
+        ppp = self._services.get('ppp')
+        if ppp is not None and ppp.is_running:
+            try:
+                ppp.stop(fast=True)
+            except Exception as e:
+                print(f"  [Harness] PPP cleanup error: {e}")
+
+    def _on_link_recovered(self):
+        """Transport re-established CMUX after a recovery."""
+        self.state.update(transport_ready=True)
+        print("  [Harness] link recovered — AT channels usable again; "
+              "PPP needs a fresh 'ppp' dial")
 
     # ---- Command dispatch ----
 
@@ -274,7 +303,7 @@ class CmuxHarness:
         if dlci == 0:
             # Control channel — log and ignore
             if self._verbose and data:
-                ctrl_type = data[0] & 0xEF if data else 0
+                ctrl_type = data[0] & ~CR_BIT
                 type_names = {
                     CtrlType.CLD: 'CLD', CtrlType.TEST: 'TEST',
                     CtrlType.FCON: 'FCON', CtrlType.FCOFF: 'FCOFF',

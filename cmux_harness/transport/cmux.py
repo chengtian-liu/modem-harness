@@ -7,9 +7,10 @@ from typing import Callable, Optional
 import serial
 
 from ..protocol.cmux import (
-    FrameParser, FrameType, CtrlType,
+    FrameParser, FrameType, CtrlType, CR_BIT,
     make_sabm, make_disc, make_uih_cmd, make_cld,
     make_msc_resp, make_msc_cmd, make_msc_fc,
+    make_test, make_test_resp,
     SIGNAL_FC, decode_signals,
 )
 
@@ -18,9 +19,22 @@ from ..protocol.cmux import (
 CACHE_FRAMES = 20
 
 # How long send() waits while a DLCI is flow-control blocked before giving
-# up and dropping the frame. The C muxer waits indefinitely; an interactive
-# tool bounds it so a stuck link cannot hang the sender forever.
+# up and dropping the frame, so a stuck link cannot hang the sender forever.
 FC_WAIT_TIMEOUT = 5.0
+
+
+# ============================================================
+# Keepalive (TEST probes on DLCI 0)
+# ============================================================
+
+# Seconds between TEST probes. Typical CMUX keepalive intervals are 5–10 s;
+# a probe frame is only ~14 bytes, so even a slow 115200 link barely notices.
+DEFAULT_KEEPALIVE_INTERVAL = 0
+
+# How many consecutive unanswered probes before the link is declared dead.
+# Any frame from the modem (TEST response, NSC, MSC, PPP, AT — anything)
+# counts as an answer. 3 × 10 s ≈ 30 s of total silence.
+DEFAULT_KEEPALIVE_THRESHOLD = 3
 
 
 # ============================================================
@@ -30,8 +44,9 @@ FC_WAIT_TIMEOUT = 5.0
 class CmuxTE:
     """CMUX TE side controller"""
 
-    def __init__(self, frame_size: int = 0):
+    def __init__(self, frame_size: int = 0, verbose: bool = False):
         self.frame_size = frame_size
+        self.verbose = verbose
         self.ser = None
         self.parser = FrameParser()
         self.dlc_available = {0: False, 1: False, 2: False}
@@ -95,8 +110,8 @@ class CmuxTE:
         """Wire size of a full-size UIH frame (payload == N1).
 
         Overhead is flag+addr+ctrl+len(1 or 2)+fcs+flag = 6 bytes when
-        N1 <= 127 (1-byte length), 7 bytes when N1 > 127 (2-byte length).
-        Matches cmux_FRAME in the C code (N1=127 → 133).
+        N1 <= 127 (1-byte length), 7 bytes when N1 > 127 (2-byte length),
+        e.g. N1=127 → 133 bytes on the wire.
         """
         n1 = self.frame_size if self.frame_size > 0 else 127
         return n1 + (7 if n1 > 127 else 6)
@@ -205,10 +220,12 @@ class CmuxTE:
 
             sig_desc = decode_signals(signals)
             if old_allowed != (not fc_set):
+                # Flow control state actually changed — a real event, always shown
                 action = 'BLOCKED' if fc_set else 'ALLOWED'
                 print(f"  [MSC] DLCI {dlci}: FC={'on' if fc_set else 'off'} "
                       f"({sig_desc}) → {action}")
-            else:
+            elif self.verbose:
+                # Same state again — noise unless debugging
                 print(f"  [MSC] DLCI {dlci}: {sig_desc}")
 
             # Acknowledge — respond with C/R cleared, preserve P/F
@@ -217,9 +234,13 @@ class CmuxTE:
                 resp = make_msc_resp(info, pf=pf)
                 self.send_raw(resp)
         else:
-            # ACK for our MSC command
-            sig_desc = decode_signals(signals)
-            print(f"  [MSC ACK] DLCI {dlci}: {sig_desc}")
+            # C/R cleared — response to an MSC command we sent, or on modules
+            # that never get commands from us, an unsolicited status report
+            # (e.g. the data channel reporting RTC|RTR when it comes up).
+            # Purely informational, so kept out of normal output.
+            if self.verbose:
+                sig_desc = decode_signals(signals)
+                print(f"  [MSC ACK] DLCI {dlci}: {sig_desc}")
 
     def send_msc(self, dlci: int, fc_on: bool):
         """Send MSC command to modem to set flow control on a DLCI.
@@ -334,13 +355,40 @@ class CmuxTE:
 class CmuxTransport:
     """CMUX transport implementation — wraps CmuxTE."""
 
-    def __init__(self, frame_size: int = 0, verbose: bool = False):
-        self._cmux = CmuxTE(frame_size=frame_size)
+    def __init__(self, frame_size: int = 0, verbose: bool = False,
+                 keepalive: float = DEFAULT_KEEPALIVE_INTERVAL,
+                 keepalive_threshold: int = DEFAULT_KEEPALIVE_THRESHOLD):
+        self._cmux = CmuxTE(frame_size=frame_size, verbose=verbose)
         self._verbose = verbose
         self._on_frame: Optional[Callable[[int, bytes], None]] = None
         self._running = False
         self._reader_thread: Optional[threading.Thread] = None
         self._dialing = False
+
+        # ---- Keepalive (TEST probes on DLCI 0) ----
+        # 0 disables keepalive entirely.
+        self._keepalive_interval = float(keepalive)
+        self._keepalive_threshold = int(keepalive_threshold)
+        self._keepalive_running = False
+        self._keepalive_thread: Optional[threading.Thread] = None
+        # Consecutive TEST probes sent since the last frame received from
+        # the modem. Any received frame — TEST response, NSC, MSC, PPP or AT
+        # data — proves liveness and resets this to zero.
+        self._unanswered = 0
+        # While True the reader loop hands the serial port over to the
+        # recovery routine (same exclusive-access idea as `_dialing`).
+        self._recovering = False
+        # Link-down already announced to the harness for the current outage
+        # (so the callback fires once per outage, not once per retry cycle).
+        self._link_down_reported = False
+        # Stats
+        self.keepalive_probes = 0   # total TEST probes sent
+        self.recovery_count = 0     # successful link recoveries
+        # Optional hooks for the harness layer:
+        #   on_link_down      — link declared dead, before recovery starts
+        #   on_link_recovered — CMUX re-established after a recovery
+        self.on_link_down: Optional[Callable[[], None]] = None
+        self.on_link_recovered: Optional[Callable[[], None]] = None
 
     # ---- TransportInterface methods ----
 
@@ -356,8 +404,7 @@ class CmuxTransport:
         # MSC flow control: if the modem told us to stop (FC=1), wait for
         # the channel to be re-allowed instead of dropping the frame.
         # Senders stall here, so nothing is read out of the upstream buffer
-        # (wintun) and backpressure propagates to the IP stack — the same
-        # strategy as the C muxer, which stops reading a blocked channel.
+        # (wintun) and backpressure propagates to the IP stack.
         te = self._cmux
         if dlci > 0 and not te.frame_allowed.get(dlci, True):
             deadline = time.time() + FC_WAIT_TIMEOUT
@@ -379,7 +426,24 @@ class CmuxTransport:
         self._reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
         self._reader_thread.start()
 
+        # Keepalive starts together with the reader — CMUX is up at this point
+        if self._keepalive_interval > 0:
+            self._unanswered = 0
+            self._keepalive_running = True
+            self._keepalive_thread = threading.Thread(
+                target=self._keepalive_loop, daemon=True)
+            self._keepalive_thread.start()
+            print(f"[CMUX] keepalive enabled: TEST probe every "
+                  f"{self._keepalive_interval:g}s, link-down after "
+                  f"{self._keepalive_threshold} unanswered "
+                  f"(~{self._keepalive_interval * self._keepalive_threshold:g}s silence)")
+
     def stop_reader(self) -> None:
+        # Stop keepalive first so no probe/recovery runs while we shut down
+        self._keepalive_running = False
+        if self._keepalive_thread:
+            self._keepalive_thread.join(timeout=3)
+            self._keepalive_thread = None
         self._running = False
         if self._reader_thread:
             self._reader_thread.join(timeout=2)
@@ -421,7 +485,7 @@ class CmuxTransport:
     def _reader_loop(self):
         while self._running:
             try:
-                if self._dialing:
+                if self._dialing or self._recovering:
                     time.sleep(0.05)
                     continue
                 if self._cmux.ser and self._cmux.ser.is_open and self._cmux.ser.in_waiting:
@@ -444,13 +508,31 @@ class CmuxTransport:
         dlci = frame['dlci']
         info = frame['info']
 
+        # Any frame that made it through the parser is proof the modem is
+        # alive — keepalive resets its unanswered-probe counter on it.
+        self._unanswered = 0
+
         if dlci == 0:
             if info:
-                ctrl_type = info[0] & 0xEF if info else 0
+                # Mask off C/R so commands (0xE3) and responses (0xE1) both
+                # match their CtrlType constant.
+                ctrl_type = info[0] & ~CR_BIT
 
                 # Handle MSC (Modem Status Command) — flow control
                 if ctrl_type == CtrlType.MSC:
                     self._cmux._handle_msc(frame)
+                    return
+
+                # Handle TEST — if the modem probes *us*, echo the payload
+                # back as a response (C/R cleared) so its keepalive is
+                # answered too.
+                if ctrl_type == CtrlType.TEST:
+                    if info[0] & CR_BIT and len(info) >= 2:
+                        resp = make_test_resp(info, pf=frame.get('pf', 0))
+                        self._cmux.send_raw(resp)
+                        print(f"  [DLCI 0] TEST command from modem, responded")
+                    elif self._verbose:
+                        print(f"  [DLCI 0] TEST response {info.hex(' ')}")
                     return
 
                 type_names = {
@@ -459,7 +541,130 @@ class CmuxTransport:
                     CtrlType.MSC: 'MSC', CtrlType.NSC: 'NSC',
                 }
                 name = type_names.get(ctrl_type, f'0x{ctrl_type:02X}')
+                if name == 'NSC' and self._verbose:
+                    print(f"  [DLCI 0] NSC — modem rejected a control command "
+                          f"(may not support it, link is still alive)")
                 if self._verbose:
                     print(f"  [DLCI 0] {name} {info.hex(' ')}")
         elif self._on_frame:
             self._on_frame(dlci, info)
+
+    # ---- Keepalive ----
+
+    def _keepalive_loop(self):
+        """Periodically send TEST probes on DLCI 0 and watch for total silence.
+
+        Every interval a TEST command goes out; any frame coming back from
+        the modem (TEST response, NSC, MSC, PPP data — anything) proves it
+        is alive and resets the counter. When N consecutive probes go
+        unanswered the link is declared dead, the harness is notified, and
+        recovery (CLD + full CMUX re-init) is retried every cycle until it
+        succeeds.
+        """
+        interval = self._keepalive_interval
+        try:
+            while self._keepalive_running:
+                # Sleep in small steps so stop_reader() stays responsive
+                deadline = time.time() + interval
+                while self._keepalive_running and time.time() < deadline:
+                    time.sleep(0.2)
+                if not self._keepalive_running:
+                    break
+
+                te = self._cmux
+                if not (te.ser and te.ser.is_open):
+                    continue
+                # During dialing/recovery the reader is paused, so any reply
+                # would sit unread in the serial buffer — don't probe, don't
+                # judge, and give the next window a fresh counter.
+                if self._dialing or self._recovering:
+                    self._unanswered = 0
+                    continue
+
+                te.send_raw(make_test())
+                self.keepalive_probes += 1
+                self._unanswered += 1
+                if self._unanswered <= 1:
+                    # Healthy heartbeat — silent unless --verbose is on.
+                    if self._verbose:
+                        print(f"  [Keepalive] TEST probe #{self.keepalive_probes}")
+                else:
+                    print(f"  [Keepalive] TEST probe #{self.keepalive_probes} "
+                          f"— no reply, {self._unanswered} unanswered")
+
+                if self._unanswered >= self._keepalive_threshold:
+                    silent = interval * self._unanswered
+                    print(f"\n  [Keepalive] no frame from modem for ~{silent:.0f}s "
+                          f"({self._unanswered} unanswered probes), link presumed dead")
+                    self._handle_link_down()
+        except Exception as e:
+            if self._keepalive_running:
+                print(f"  [Keepalive] thread error: {e}")
+
+    def _handle_link_down(self):
+        """Notify the harness once per outage, then try to recover the link."""
+        if not self._link_down_reported:
+            self._link_down_reported = True
+            if self.on_link_down:
+                try:
+                    self.on_link_down()
+                except Exception as e:
+                    print(f"  [Keepalive] on_link_down hook error: {e}")
+        self._recover_link()
+
+    def _recover_link(self):
+        """Try to bring CMUX back: CLD → re-init → re-establish DLCIs.
+
+        The reader loop is paused for the duration (`_recovering`) so the
+        init routine gets exclusive access to the serial port, the same
+        pattern PPP dialing uses. Retried every keepalive cycle until it
+        succeeds — the modem may need several attempts to come back.
+        """
+        print("  [Keepalive] attempting link recovery (CLD + CMUX re-init)...")
+        self._recovering = True
+        try:
+            te = self._cmux
+
+            # Reset local mux state so init starts clean
+            te.parser = FrameParser()
+            te.dlc_available = {0: False, 1: False, 2: False}
+            te.frame_allowed = {1: True, 2: True}
+            with te._fc_cond:
+                te._fc_cond.notify_all()  # wake senders stalled on the dead link
+
+            # If the modem still parses frames, ask it to shut its mux down
+            # first; if it is already hung this just times out harmlessly.
+            try:
+                if te.ser and te.ser.is_open:
+                    te.send_raw(make_cld())
+                    time.sleep(0.5)
+                    te.ser.reset_input_buffer()
+            except Exception:
+                pass
+
+            if not self._keepalive_running:
+                return False  # shutdown in progress, don't re-init
+
+            ok = te.init_cmux()
+            if not self._keepalive_running:
+                return ok
+
+            if ok:
+                self._unanswered = 0
+                self._link_down_reported = False
+                self.recovery_count += 1
+                print(f"  [Keepalive] ✓ link recovered "
+                      f"(total recoveries: {self.recovery_count})")
+                if self.on_link_recovered:
+                    try:
+                        self.on_link_recovered()
+                    except Exception as e:
+                        print(f"  [Keepalive] on_link_recovered hook error: {e}")
+            else:
+                print("  [Keepalive] ✗ recovery failed, retrying next cycle")
+            return ok
+        except Exception as e:
+            print(f"  [Keepalive] recovery error: {e}")
+            return False
+        finally:
+            self._recovering = False

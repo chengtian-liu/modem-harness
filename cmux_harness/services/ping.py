@@ -1,5 +1,6 @@
 """Ping service — delegates to system ping, routed through PPP TUN adapter."""
 
+import socket
 import subprocess
 from typing import Optional, TYPE_CHECKING
 
@@ -33,6 +34,7 @@ class PingService(ServiceInterface):
 
         # Build system ping args, passing through user flags
         ping_args = ['ping']
+        target = None
         i = 1
         while i < len(args):
             if args[i] == '-t':
@@ -49,6 +51,7 @@ class PingService(ServiceInterface):
                 ping_args.extend(['-w', args[i + 1]])
                 i += 2
             elif not args[i].startswith('-'):
+                target = args[i]
                 ping_args.append(args[i])
                 i += 1
             else:
@@ -56,8 +59,20 @@ class PingService(ServiceInterface):
                 i += 1
 
         # Default target if none given
-        if len(ping_args) == 1:
-            ping_args.append('8.8.8.8')
+        if target is None:
+            target = '8.8.8.8'
+            ping_args.append(target)
+
+        # Resolve hostname to IP for route injection
+        target_ip = self._resolve(target)
+        if target_ip is None:
+            print(f"  [ping] cannot resolve: {target}")
+            return None
+
+        # Add route through TUN adapter
+        ppp_service = self._harness.get_service('ppp')
+        if ppp_service:
+            ppp_service.add_route(target_ip)
 
         try:
             print()
@@ -66,6 +81,9 @@ class PingService(ServiceInterface):
             print()
         except Exception as e:
             print(f"  [ping] error: {e}")
+        finally:
+            if ppp_service:
+                ppp_service.del_route(target_ip)
         return None
 
     def on_shutdown(self) -> None:
@@ -77,3 +95,17 @@ class PingService(ServiceInterface):
 
     def _on_ppp_down(self, **kwargs):
         self._ppp_ready = False
+
+    @staticmethod
+    def _resolve(host: str) -> Optional[str]:
+        """Resolve hostname to IPv4 address. Returns None on failure."""
+        try:
+            # If already an IP, this returns it as-is
+            socket.inet_aton(host)
+            return host
+        except OSError:
+            pass
+        try:
+            return socket.gethostbyname(host)
+        except socket.gaierror:
+            return None

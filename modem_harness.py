@@ -13,6 +13,7 @@ Usage:
   python modem_harness.py COM11 115200 --serial        # Direct Serial mode
   python modem_harness.py COM11 115200 --verbose
   python modem_harness.py COM11 115200 --frame-size 512
+  python modem_harness.py COM11 115200 --keepalive 5   # TEST probe every 5s
 """
 
 import sys
@@ -36,6 +37,7 @@ except ImportError:
 from cmux_harness import (
     CmuxHarness, SharedState, Event, EventBus, ServiceInterface,
     AtService, AtChannel, PppService, PingService, FtpService, FtpSpeedTester, IperfService,
+    DEFAULT_KEEPALIVE_INTERVAL,
 )
 from cmux_harness.services.at import AT_COMMANDS
 
@@ -290,8 +292,24 @@ def _interactive_setup(is_first_run: bool = True):
             except ValueError:
                 print(f"  invalid frame size: {frame_str}, please re-enter")
 
+    keepalive = DEFAULT_KEEPALIVE_INTERVAL
+    if mode == 'cmux':
+        while True:
+            ka_str = input(f"  enter keepalive TEST interval in seconds (default {DEFAULT_KEEPALIVE_INTERVAL:g}, 0=disable): ").strip()
+            if not ka_str:
+                break
+            try:
+                ka = float(ka_str)
+                if ka < 0:
+                    raise ValueError
+                keepalive = ka
+                break
+            except ValueError:
+                print(f"  invalid interval: {ka_str}, please re-enter")
+
     return argparse.Namespace(port=port, baudrate=baudrate, verbose=False,
-                               frame_size=frame_size, serial=(mode == 'serial'))
+                               frame_size=frame_size, serial=(mode == 'serial'),
+                               keepalive=keepalive)
 
 
 # ============================================================
@@ -307,6 +325,7 @@ Examples:
   python modem_harness.py COM11 115200                # CMUX mode (default)
   python modem_harness.py COM11 115200 --serial       # Direct Serial mode
   python modem_harness.py COM11 115200 --verbose
+  python modem_harness.py COM11 115200 --keepalive 5  # TEST probe every 5s
         """
     )
     parser.add_argument('port', nargs='?', default=None, help='serial port')
@@ -314,6 +333,8 @@ Examples:
     parser.add_argument('--verbose', '-v', action='store_true', help='print raw data')
     parser.add_argument('--frame-size', '-f', type=int, default=0,
                         help='CMUX max frame size (N1), 0=default, e.g. 128/256/512/1024/1500')
+    parser.add_argument('--keepalive', '-k', type=float, default=DEFAULT_KEEPALIVE_INTERVAL,
+                        help='CMUX keepalive TEST interval in seconds, 0 disables (default: 10)')
     parser.add_argument('--serial', action='store_true',
                         help='Direct Serial mode (skip CMUX, PPP runs directly on serial)')
 
@@ -337,7 +358,8 @@ Examples:
 
         # ---- Build harness ----
         mode = 'serial' if args.serial else 'cmux'
-        harness = CmuxHarness(mode=mode, verbose=args.verbose, frame_size=args.frame_size)
+        harness = CmuxHarness(mode=mode, verbose=args.verbose, frame_size=args.frame_size,
+                              keepalive=args.keepalive)
 
         # Register services
         at_service = AtService(verbose=args.verbose)
