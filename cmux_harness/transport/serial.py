@@ -21,7 +21,8 @@ class SerialTransport:
 
     # ---- TransportInterface methods ----
 
-    def open(self, port: str, baudrate: int) -> None:
+    def open(self, port: str, baudrate: int, cmux_baudrate: int = None) -> None:
+        # cmux_baudrate is ignored in serial mode (no CMUX, single fixed speed)
         self._ser = serial.Serial(
             port=port,
             baudrate=baudrate,

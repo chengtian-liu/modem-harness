@@ -22,16 +22,17 @@ class CmuxHarness:
         1. harness = CmuxHarness(mode='cmux', ...)
         2. harness.register(AtService())
         3. harness.register(PppService())
-        4. harness.start(port, baudrate)
+        4. harness.start(port, baudrate[, cmux_baudrate])
         5. harness.dispatch(cmd) in a loop
         6. harness.shutdown()
     """
 
     def __init__(self, mode: str = 'cmux', verbose: bool = False, frame_size: int = 0,
-                 keepalive: float = DEFAULT_KEEPALIVE_INTERVAL):
+                 keepalive: float = DEFAULT_KEEPALIVE_INTERVAL, channels: int = 2):
         self._mode = mode
         self._verbose = verbose
         self._frame_size = frame_size
+        self._channels = channels
         self._running = False
         self._services: dict[str, ServiceInterface] = {}
         self._service_order: list[str] = []
@@ -46,7 +47,8 @@ class CmuxHarness:
             self.transport: TransportInterface = SerialTransport(verbose=verbose)
         else:
             self.transport: TransportInterface = CmuxTransport(
-                frame_size=frame_size, verbose=verbose, keepalive=keepalive
+                frame_size=frame_size, verbose=verbose, keepalive=keepalive,
+                channels=channels
             )
             # Keepalive hooks: when the transport declares the CMUX link dead,
             # tear down link-dependent services; when it recovers, mark the
@@ -86,8 +88,14 @@ class CmuxHarness:
 
     # ---- Lifecycle ----
 
-    def start(self, port: str, baudrate: int) -> bool:
-        """Open transport, initialize CMUX if needed, register services, start reader."""
+    def start(self, port: str, baudrate: int, cmux_baudrate: int = None) -> bool:
+        """Open transport, initialize CMUX if needed, register services, start reader.
+
+        baudrate — initial serial speed (AT handshake).
+        cmux_baudrate — CMUX target speed (CMUX mode only). When it differs
+        from baudrate the module switches its UART via AT+CMUX <port_speed>
+        and the host port is reopened at the new speed.
+        """
         self.state.update(transport_ready=False)
 
         mode_label = 'Direct Serial' if self._mode == 'serial' else 'CMUX Multiplex'
@@ -95,11 +103,14 @@ class CmuxHarness:
         print(f"  {mode_label} Terminal")
         print(f"  Copyright (c) 2026 chengtian.liu")
         print(f"  Author: chengtian.liu")
-        print(f"  Serial: {port} @ {baudrate}")
+        if cmux_baudrate and cmux_baudrate != baudrate:
+            print(f"  Serial: {port} @ {baudrate} -> CMUX @ {cmux_baudrate}")
+        else:
+            print(f"  Serial: {port} @ {baudrate}")
         print(f"{'='*60}")
 
         try:
-            self.transport.open(port, baudrate)
+            self.transport.open(port, baudrate, cmux_baudrate)
         except Exception as e:
             print(f"  Transport open failed: {e}")
             return False
@@ -120,12 +131,12 @@ class CmuxHarness:
             except Exception as e:
                 print(f"  [Harness] error registering service '{name}': {e}")
 
-        # Create AT channels for CMUX mode
+        # Create AT channels for CMUX mode — one per established data DLCI
         if self._mode == 'cmux' and self._at_service:
             cmux_transport = self.transport
             if hasattr(cmux_transport, 'dlc_available'):
-                for dlci in [1, 2]:
-                    if cmux_transport.dlc_available.get(dlci):
+                for dlci, available in sorted(cmux_transport.dlc_available.items()):
+                    if dlci > 0 and available:
                         self._at_service.create_channel(dlci)
 
         # Serial mode: create virtual channel for AT responses
@@ -178,7 +189,7 @@ class CmuxHarness:
         ppp = self._services.get('ppp')
         if ppp is not None and ppp.is_running:
             try:
-                ppp.stop(fast=True)
+                ppp.stop(fast=True, teardown_serial=False)
             except Exception as e:
                 print(f"  [Harness] PPP cleanup error: {e}")
 
@@ -338,10 +349,11 @@ class CmuxHarness:
             print(f"    AT+<cmd>                        Send AT command (e.g. AT+CSQ)")
             print(f"    quit                            Quit")
         else:
-            print(f"  [CMUX Mode]")
+            print(f"  [CMUX Mode] — {self._channels} data channels")
             print(f"  {sep}")
             print(f"    1>ATI                           Send AT command on DLCI 1")
-            print(f"    2>AT+CSQ                        Send AT command on DLCI 2")
+            if self._channels >= 2:
+                print(f"    {f'{self._channels}>AT+CSQ'.ljust(32)}Send AT command on DLCI {self._channels}")
             print(f"    ppp [dlci]                      Start PPP dialup (default: DLCI 2)")
             print(f"    ppp stop                        Stop PPP")
             print(f"    ping [args]                     System ping (e.g. ping -l 1024 8.8.8.8)")

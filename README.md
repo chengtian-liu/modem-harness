@@ -82,15 +82,24 @@ The tool separates transport from application logic: CMUX and Direct Serial are 
 # CMUX mode (default) — AT commands + PPP on separate DLCI channels
 python modem_harness.py COM11 115200 --frame-size 512
 
+# CMUX mode with 4 data channels (DLCI 1-4; channels the module does not
+# support are rejected and stay down automatically)
+python modem_harness.py COM11 115200 --channels 4
+
+# CMUX mode with a baud-rate switch: open the port at 115200 for the AT
+# handshake; the module switches to 460800 via AT+CMUX <port_speed>
+python modem_harness.py COM11 115200 --cmux-baudrate 460800
+
 # Direct Serial mode — all features available, no CMUX overhead
 python modem_harness.py COM11 115200 --serial
 
-# Interactive mode — select port, baud rate, frame size, and mode step by step
+# Interactive mode — select port, baud rate, frame size, channels, and mode step by step
 python modem_harness.py
 ```
 
 If you double-click `modem_harness.py` in File Explorer, it will start in interactive mode
-and ask for the serial port, baud rate, CMUX frame size, and mode (CMUX or Direct Serial) step by step.
+and ask for the serial port, baud rate, CMUX target baud rate, frame size, channels, and mode
+(CMUX or Direct Serial) step by step.
 
 Once connected:
 
@@ -98,7 +107,9 @@ Once connected:
 # CMUX mode
 [cmux] > 1>AT+CSQ                       # Send AT on DLCI 1
 [cmux] > 2>AT+CGMI                      # Send AT on DLCI 2
+[cmux] > 3>AT+CGMI                      # Send AT on DLCI 3 (with --channels 4)
 [cmux] > ppp                            # Start PPP dialup on DLCI 2
+[cmux] > ppp 3                          # Start PPP dialup on DLCI 3
 
 # Direct Serial mode
 [serial] > AT+CSQ                       # Send AT directly
@@ -116,8 +127,7 @@ Once connected:
 | Command                         | Description                                                                 |
 |---------------------------------|-----------------------------------------------------------------------------|
 | `at <cmd>`                      | Send AT command (DLCI 1 in CMUX mode, direct in serial mode)                |
-| `1>AT+CSQ`                      | Send AT command on DLCI 1 (CMUX mode only)                                  |
-| `2>AT+CGMI`                     | Send AT command on DLCI 2 (CMUX mode only)                                  |
+| `N>AT+CSQ`                      | Send AT command on DLCI N (CMUX mode only, N = 1..channel count)            |
 | `ppp [dlci] [--apn APN]`        | Start PPP dialup on given DLCI (default DLCI 2, no DLCI in serial mode)     |
 | `ppp stop`                      | Stop PPP                                                                    |
 | `ping [ip] [size]`              | Ping target IP (default 8.8.8.8, 32B)                                       |
@@ -131,9 +141,12 @@ Once connected:
 | Option               | Description                                                              |
 |----------------------|--------------------------------------------------------------------------|
 | `port`               | Serial port (e.g. `COM11`). If omitted, prompts interactively.           |
-| `baudrate`           | Baud rate (default `115200`).                                            |
+| `baudrate`           | Initial baud rate for the AT handshake (default `115200`).               |
+| `--cmux-baudrate`, `-b` | CMUX target baud rate (default: same as `baudrate`). When different, the module switches to it via the `<port_speed>` parameter of `AT+CMUX` and the port is reopened at the new speed. `<port_speed>` uses the Quectel mapping (`5`=115200, `7`=460800, ...). |
 | `--verbose`, `-v`    | Print raw serial data (hex dump).                                        |
 | `--frame-size`, `-f` | CMUX max frame size N1 (default `0` = auto).                             |
+| `--keepalive`, `-k`  | CMUX keepalive TEST interval in seconds, `0` disables (default `10`).    |
+| `--channels`, `-n`   | CMUX data channel count, DLCI 1..N (default `2`, e.g. `4`). Channels the module rejects stay down automatically. |
 | `--serial`           | Direct Serial PPP mode (skip CMUX, PPP runs directly on serial).         |
 
 ## FTP Configuration
@@ -218,6 +231,11 @@ pip install prompt_toolkit
                                         │ TUN Adapter │──► System TCP/IP
                                         └─────────────┘
 ```
+
+The data channel count is configurable with `--channels N` (default 2). With `--channels 4`
+the engine establishes DLCI 1-4, each usable for AT commands (`1>` ... `4>`) or PPP
+(`ppp 3`). GSM 07.10 addresses up to 63 DLCIs, but the module decides how many it grants —
+a SABM on an unsupported DLCI gets a DM response and that channel simply stays down.
 
 **Direct Serial mode** — raw serial, no CMUX overhead, PPP takes over the line:
 

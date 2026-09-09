@@ -14,6 +14,9 @@ Usage:
   python modem_harness.py COM11 115200 --verbose
   python modem_harness.py COM11 115200 --frame-size 512
   python modem_harness.py COM11 115200 --keepalive 5   # TEST probe every 5s
+  python modem_harness.py COM11 115200 --channels 4    # 4 CMUX data channels
+  python modem_harness.py COM11 115200 --cmux-baudrate 460800
+        # open at 115200; module switches to 460800 via AT+CMUX <port_speed>
 """
 
 import sys
@@ -279,6 +282,20 @@ def _interactive_setup(is_first_run: bool = True):
     if mode_choice == '2':
         mode = 'serial'
 
+    cmux_baudrate = None
+    if mode == 'cmux':
+        while True:
+            cb_str = input(f"  enter CMUX target baud rate (default = keep {baudrate}, "
+                           f"e.g. 460800 to speed up): ").strip()
+            if not cb_str:
+                cmux_baudrate = baudrate  # same as current, no switch
+                break
+            try:
+                cmux_baudrate = int(cb_str)
+                break
+            except ValueError:
+                print(f"  invalid baud rate: {cb_str}, please re-enter")
+
     frame_size = 0
     if mode == 'cmux':
         while True:
@@ -293,6 +310,7 @@ def _interactive_setup(is_first_run: bool = True):
                 print(f"  invalid frame size: {frame_str}, please re-enter")
 
     keepalive = DEFAULT_KEEPALIVE_INTERVAL
+    channels = 2
     if mode == 'cmux':
         while True:
             ka_str = input(f"  enter keepalive TEST interval in seconds (default {DEFAULT_KEEPALIVE_INTERVAL:g}, 0=disable): ").strip()
@@ -307,9 +325,23 @@ def _interactive_setup(is_first_run: bool = True):
             except ValueError:
                 print(f"  invalid interval: {ka_str}, please re-enter")
 
+        while True:
+            ch_str = input("  enter CMUX data channel count (default 2, e.g. 4): ").strip()
+            if not ch_str:
+                break
+            try:
+                ch = int(ch_str)
+                if not 1 <= ch <= 63:
+                    raise ValueError
+                channels = ch
+                break
+            except ValueError:
+                print(f"  invalid channel count: {ch_str} (must be 1-63), please re-enter")
+
     return argparse.Namespace(port=port, baudrate=baudrate, verbose=False,
                                frame_size=frame_size, serial=(mode == 'serial'),
-                               keepalive=keepalive)
+                               keepalive=keepalive, channels=channels,
+                               cmux_baudrate=cmux_baudrate)
 
 
 # ============================================================
@@ -326,15 +358,26 @@ Examples:
   python modem_harness.py COM11 115200 --serial       # Direct Serial mode
   python modem_harness.py COM11 115200 --verbose
   python modem_harness.py COM11 115200 --keepalive 5  # TEST probe every 5s
+  python modem_harness.py COM11 115200 --channels 4   # 4 CMUX data channels (DLCI 1-4)
+  python modem_harness.py COM11 115200 --cmux-baudrate 460800
+        # open at 115200; module switches to 460800 via AT+CMUX <port_speed>
         """
     )
     parser.add_argument('port', nargs='?', default=None, help='serial port')
     parser.add_argument('baudrate', type=int, nargs='?', default=115200, help='baud rate')
+    parser.add_argument('--cmux-baudrate', '-b', type=int, default=None,
+                        help='CMUX target baud rate. When different from baudrate the module '
+                             'switches its UART via AT+CMUX <port_speed> and the port is '
+                             'reopened at the new speed (default: same as baudrate, no switch). '
+                             'CMUX mode only.')
     parser.add_argument('--verbose', '-v', action='store_true', help='print raw data')
     parser.add_argument('--frame-size', '-f', type=int, default=0,
                         help='CMUX max frame size (N1), 0=default, e.g. 128/256/512/1024/1500')
     parser.add_argument('--keepalive', '-k', type=float, default=DEFAULT_KEEPALIVE_INTERVAL,
                         help='CMUX keepalive TEST interval in seconds, 0 disables (default: 10)')
+    parser.add_argument('--channels', '-n', type=int, default=2,
+                        help='CMUX data channel count, DLCI 1..N (default: 2, e.g. 4). '
+                             'Channels the module does not support stay down automatically.')
     parser.add_argument('--serial', action='store_true',
                         help='Direct Serial mode (skip CMUX, PPP runs directly on serial)')
 
@@ -358,8 +401,11 @@ Examples:
 
         # ---- Build harness ----
         mode = 'serial' if args.serial else 'cmux'
+        channels = getattr(args, 'channels', 2)
+        if mode == 'serial':
+            channels = 0  # serial mode has no CMUX channels
         harness = CmuxHarness(mode=mode, verbose=args.verbose, frame_size=args.frame_size,
-                              keepalive=args.keepalive)
+                              keepalive=args.keepalive, channels=channels)
 
         # Register services
         at_service = AtService(verbose=args.verbose)
@@ -390,7 +436,8 @@ Examples:
                 _console_handler_ref = _console_handler
 
         try:
-            if not harness.start(args.port, args.baudrate):
+            if not harness.start(args.port, args.baudrate,
+                                 getattr(args, 'cmux_baudrate', None)):
                 if len(sys.argv) > 1:
                     sys.exit(1)
                 continue  # back to menu on failure

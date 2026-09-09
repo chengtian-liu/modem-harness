@@ -22,6 +22,23 @@ CACHE_FRAMES = 20
 # up and dropping the frame, so a stuck link cannot hang the sender forever.
 FC_WAIT_TIMEOUT = 5.0
 
+# ============================================================
+# AT+CMUX <port_speed> mapping
+# ============================================================
+
+# Quectel-style <port_speed> enumeration used in AT+CMUX=0,0,<speed>,<N1>
+# (same values as quectel_speeds[] in the reference gsm0710muxd driver).
+# NOTE: this is NOT the 3GPP TS 27.007 enumeration (which starts at 0=9600).
+PORT_SPEED_INDEX = {
+    9600: 1, 19200: 2, 38400: 3, 57600: 4,
+    115200: 5, 230400: 6, 460800: 7, 921600: 8,
+    1500000: 16, 2000000: 20, 3000000: 23, 4000000: 26,
+}
+
+# Default N1 advertised to the module when the user did not pick a frame
+# size — same default the engine uses locally (see _full_frame_size).
+DEFAULT_N1 = 127
+
 
 # ============================================================
 # Keepalive (TEST probes on DLCI 0)
@@ -44,13 +61,26 @@ DEFAULT_KEEPALIVE_THRESHOLD = 3
 class CmuxTE:
     """CMUX TE side controller"""
 
-    def __init__(self, frame_size: int = 0, verbose: bool = False):
+    def __init__(self, frame_size: int = 0, verbose: bool = False, channels: int = 2):
         self.frame_size = frame_size
         self.verbose = verbose
+        self.port = None
+        self.baudrate = 0   # current serial speed, set in open()
+        self.open_baudrate = 0  # speed the port was first opened at (entry
+                                # speed); some modules restore it after CLD
+        self.cmux_baudrate = 0  # CMUX target speed; != baudrate triggers a switch
+        # Set once the mux is actually established (DLCI 0 up); close() uses
+        # it to decide whether CLD is needed even if dlc_available was reset.
+        self.mux_established = False
+        # Number of data channels (DLCI 1..channels); DLCI 0 is always the
+        # control channel. GSM 07.10 allows up to 63 DLCIs, but the module
+        # decides how many it actually grants — SABM on an unsupported DLCI
+        # just gets a DM response and the channel stays down.
+        self.channels = channels
         self.ser = None
         self.parser = FrameParser()
-        self.dlc_available = {0: False, 1: False, 2: False}
-        self.frame_allowed = {1: True, 2: True}  # MSC flow control: assume allowed until told otherwise
+        self.dlc_available = {d: False for d in range(channels + 1)}
+        self.frame_allowed = {d: True for d in range(1, channels + 1)}  # MSC flow control: assume allowed until told otherwise
         self.running = False
         self.lock = threading.Lock()
         # MSC flow control: senders block on this condition while a DLCI is
@@ -64,8 +94,19 @@ class CmuxTE:
         self._write_cache = bytearray()
         self._cache_frames = 0
 
-    def open(self, port: str, baudrate: int):
-        self.ser = serial.Serial(
+    def open(self, port: str, baudrate: int, cmux_baudrate: int = None):
+        self.port = port
+        self.baudrate = baudrate
+        self.open_baudrate = baudrate
+        self.cmux_baudrate = cmux_baudrate if cmux_baudrate else baudrate
+        self.ser = self._make_serial(port, baudrate)
+        print(f"[Serial] {port} opened, baudrate={baudrate}")
+        if self.cmux_baudrate != baudrate:
+            print(f"[Serial] CMUX target baudrate={self.cmux_baudrate} "
+                  f"(module switches to it via AT+CMUX <port_speed>)")
+
+    def _make_serial(self, port: str, baudrate: int) -> serial.Serial:
+        return serial.Serial(
             port=port,
             baudrate=baudrate,
             bytesize=serial.EIGHTBITS,
@@ -73,37 +114,151 @@ class CmuxTE:
             stopbits=serial.STOPBITS_ONE,
             timeout=0.1,
         )
-        print(f"[Serial] {port} opened, baudrate={baudrate}")
+
+    # ---- Shutdown ----
 
     def close(self):
-        """Exit CMUX mode on modem, then close serial port.
+        """Exit CMUX mode on the modem, then close the serial port.
 
-        Uses CLD (Close Down) — the standard GSM 07.10 command to shut down
-        the entire multiplexer and return the modem to AT command mode.
+        Teardown follows the GSM 07.10 order:
+          1. DISC every open data channel (lets the module release
+             per-channel state such as a PPP session)
+          2. CLD (Close Down) on the control channel to shut the whole
+             multiplexer down
+          3. probe with plain AT until the modem answers again
+
+        Step 3 retries several times: the module can need a moment to
+        leave multiplexer mode and re-arm its AT parser, and any AT sent
+        mid-transition is eaten as 07.10 garbage. When the baud rate was
+        switched on entry via AT+CMUX <port_speed>, a final probe at the
+        entry speed is also tried, because some modules restore the
+        pre-CMUX UART rate when the mux closes.
         """
-        if self.dlc_available[0]:
-            # Step 1: Send CLD to shut down CMUX multiplexer
+        if self.dlc_available[0] or self.mux_established:
+            # Step 0: swallow anything the module is still sending (PPP
+            # tail data, URCs). The reader thread is already stopped at
+            # this point; teardown frames sent into an unread backlog
+            # have been observed to go unanswered entirely.
+            self._drain_rx()
+
+            # Step 1: close open data channels (DISC → UA)
+            for dlci in range(1, self.channels + 1):
+                if self.dlc_available.get(dlci):
+                    self._shutdown_channel(dlci)
+
+            # Step 2: CLD shuts down the whole multiplexer
             print("[CMUX] Sending CLD (Close Down)...")
             self.send_raw(make_cld())
             time.sleep(0.3)
 
-            # Step 2: Verify modem returned to AT command mode
+            # Step 3: verify AT command mode, with retries
             print("[CMUX] Verifying AT command mode...")
-            self.ser.reset_input_buffer()
-            self.send_at("AT")
-            deadline = time.time() + 1.0
-            while time.time() < deadline:
-                raw = self.ser.read(self.ser.in_waiting or 1)
-                if raw and b"OK" in raw:
-                    print("[CMUX] ✓ Modem returned to AT command mode")
-                    break
-                time.sleep(0.05)
+            if self._wait_at_mode():
+                print("[CMUX] ✓ Modem returned to AT command mode")
+                self.mux_established = False
             else:
-                print("[CMUX] ⚠ No AT response after CLD")
+                print("[CMUX] ⚠ no AT response, retrying CLD...")
+                self.send_raw(make_cld())
+                if self._wait_at_mode():
+                    print("[CMUX] ✓ Modem returned to AT command mode (2nd CLD)")
+                    self.mux_established = False
+                elif self.open_baudrate and self.baudrate != self.open_baudrate:
+                    # possible rate restore on mux exit — probe at entry speed
+                    print(f"[CMUX] ⚠ no response at {self.baudrate}, probing at "
+                          f"entry baudrate {self.open_baudrate}...")
+                    try:
+                        self.ser.close()
+                        time.sleep(0.2)
+                        self.ser = self._make_serial(self.port, self.open_baudrate)
+                        self.baudrate = self.open_baudrate
+                        if self._wait_at_mode():
+                            print(f"[CMUX] ✓ Modem returned to AT command mode "
+                                  f"(at entry baudrate {self.open_baudrate})")
+                            self.mux_established = False
+                        else:
+                            self._report_stuck()
+                    except Exception as e:
+                        print(f"[CMUX] ⚠ entry-baudrate probe failed: {e}")
+                        self._report_stuck()
+                else:
+                    self._report_stuck()
 
         if self.ser and self.ser.is_open:
             self.ser.close()
             print(f"[Serial] {self.ser.port} closed")
+
+    def _report_stuck(self):
+        print("[CMUX] ⚠ No AT response after CLD — modem may still be in CMUX mode")
+        print("        re-run this tool to recover (it re-attaches to a running mux)")
+
+    def _drain_rx(self, timeout: float = 1.0, quiet: float = 0.15) -> None:
+        """Read and discard pending RX data before teardown.
+
+        Keeps reading until the line stays silent for `quiet` seconds or
+        `timeout` elapses altogether. The reader thread is stopped by the
+        time close() runs, so anything the module still has queued (PPP
+        tail data, Terminate-Ack, URCs) must be consumed here — modules
+        left with an unread backlog have been observed to ignore the
+        DISC/CLD teardown frames entirely.
+        """
+        deadline = time.time() + timeout
+        last_rx = time.time()
+        while time.time() < deadline:
+            try:
+                waiting = self.ser.in_waiting
+            except Exception:
+                break
+            if waiting:
+                self.ser.read(waiting)
+                last_rx = time.time()
+            elif time.time() - last_rx >= quiet:
+                break
+            else:
+                time.sleep(0.02)
+
+    def _shutdown_channel(self, dlci: int) -> None:
+        """DISC a data channel and wait briefly for the UA/DM answer."""
+        print(f"[CMUX] Closing DLCI {dlci} (DISC)...")
+        self.send_raw(make_disc(dlci))
+        deadline = time.time() + 1.0
+        while time.time() < deadline:
+            frame = self.wait_for_frame(
+                dlci=dlci, timeout=max(0.05, deadline - time.time()))
+            if frame is None:
+                break
+            if frame['type'] == FrameType.UA:
+                self.dlc_available[dlci] = False
+                print(f"  DLCI {dlci} closed (UA)")
+                return
+            if frame['type'] == FrameType.DM:
+                self.dlc_available[dlci] = False
+                print(f"  DLCI {dlci} already closed (DM)")
+                return
+            # stray data frame — keep waiting for the DISC answer
+        print(f"  DLCI {dlci}: no DISC answer — continuing, CLD will force-close")
+
+    def _wait_at_mode(self, rounds: int = 3, round_timeout: float = 1.0) -> bool:
+        """Probe with plain AT until the modem answers OK.
+
+        Runs up to `rounds` attempts of `round_timeout` seconds each,
+        draining the RX buffer before every probe. After CLD the module
+        needs a moment to leave multiplexer mode, so a single probe is
+        not reliable.
+        """
+        for _ in range(rounds):
+            self.ser.reset_input_buffer()
+            self.send_at("AT")
+            deadline = time.time() + round_timeout
+            buf = b''
+            while time.time() < deadline:
+                raw = self.ser.read(self.ser.in_waiting or 1)
+                if raw:
+                    buf += raw
+                    if b"OK" in buf:
+                        return True
+                else:
+                    time.sleep(0.02)
+        return False
 
     @property
     def _full_frame_size(self) -> int:
@@ -256,32 +411,48 @@ class CmuxTE:
             action = 'stop' if fc_on else 'resume'
             print(f"  [MSC TX] DLCI {dlci}: telling modem to {action} sending")
 
-    def init_cmux(self) -> bool:
-        print("\n" + "=" * 60)
-        print("  CMUX Initialization")
-        print("=" * 60)
+    def _reopen_serial(self, step: int) -> None:
+        """Reopen the host serial port at the CMUX target baud rate.
 
-        print("\n[Step 1] check serial port status...")
-        self.send_at("AT")
-        time.sleep(0.3)
-        warmup = self.ser.read(self.ser.in_waiting or 1024)
+        On AT+CMUX=0,0,<port_speed>,<N1> the module switches its UART to
+        <port_speed> as it enters mux mode, so the host side must follow
+        before the SABM handshake.
+        """
+        target = self.cmux_baudrate
+        print(f"\n[Step {step}] module switched to {target} baud, reopening serial port")
+        self.ser.close()
+        time.sleep(0.5)
+        self.ser = self._make_serial(self.port, target)
+        self.baudrate = target
+        print(f"[Serial] {self.port} reopened, baudrate={target}")
 
-        if b"OK" in warmup:
-            print(f"  AT mode, response: {warmup.decode('utf-8', errors='replace').strip()}")
-            print("\n[Step 2] send AT+CMUX=0")
+    def _build_cmux_command(self) -> str:
+        """Build the AT+CMUX command with <port_speed> and N1 parameters.
+
+        Format: AT+CMUX=0,0,<port_speed>,<N1>
+          <port_speed> — Quectel-style baud rate index (PORT_SPEED_INDEX),
+                         tells the module the serial rate the CMUX port
+                         runs at. Omitted when the baud rate has no index.
+          <N1>         — max frame size; the user's choice or DEFAULT_N1
+                         (same default the engine uses locally).
+        """
+        n1 = self.frame_size if self.frame_size > 0 else DEFAULT_N1
+        speed_idx = PORT_SPEED_INDEX.get(self.cmux_baudrate)
+        if speed_idx is None:
+            # Non-standard baud rate — leave the module's speed untouched
             if self.frame_size > 0:
-                cmux_cmd = f"AT+CMUX=0,0,,{self.frame_size}"
-                print(f"  specified frame size N1={self.frame_size}")
-            else:
-                cmux_cmd = "AT+CMUX=0"
-            self.send_at(cmux_cmd)
-        else:
-            print(f"  No AT response (hex: {warmup.hex() if warmup else 'empty'}), may already be in CMUX mode")
-            print("  trying to send SABM frame directly...")
-            self.send_raw(make_sabm(0))
+                return f"AT+CMUX=0,0,,{self.frame_size}"
+            return "AT+CMUX=0"
+        return f"AT+CMUX=0,0,{speed_idx},{n1}"
 
+    def _read_cmux_response(self, timeout: float = 2.0) -> bytes:
+        """Read the response after AT+CMUX (or a direct SABM).
+
+        Collects bytes until OK/ERROR text arrives, or 07.10 frames are
+        detected (module already in CMUX mode answering the SABM).
+        """
         resp = b''
-        deadline = time.time() + 2.0
+        deadline = time.time() + timeout
         while time.time() < deadline:
             chunk = self.ser.read(self.ser.in_waiting or 1)
             if chunk:
@@ -297,6 +468,52 @@ class CmuxTE:
                     break
             else:
                 time.sleep(0.02)
+        return resp
+
+    def init_cmux(self) -> bool:
+        print("\n" + "=" * 60)
+        print("  CMUX Initialization")
+        print("=" * 60)
+
+        step = 1
+        print(f"\n[Step {step}] check serial port status...")
+        self.send_at("AT")
+        time.sleep(0.3)
+        warmup = self.ser.read(self.ser.in_waiting or 1024)
+
+        if b"OK" in warmup:
+            print(f"  AT mode, response: {warmup.decode('utf-8', errors='replace').strip()}")
+            step += 1
+            cmux_cmd = self._build_cmux_command()
+            print(f"\n[Step {step}] send {cmux_cmd}")
+            speed_idx = PORT_SPEED_INDEX.get(self.cmux_baudrate)
+            if speed_idx is not None:
+                print(f"  port speed: {self.cmux_baudrate} (index {speed_idx})")
+            else:
+                print(f"  [Warning] baud rate {self.cmux_baudrate} has no <port_speed> "
+                      f"index, module keeps its current speed")
+            n1 = self.frame_size if self.frame_size > 0 else DEFAULT_N1
+            print(f"  frame size N1={n1}" + ("" if self.frame_size > 0 else " (default)"))
+            self.send_at(cmux_cmd)
+            # the module switches its UART to <port_speed> as it enters CMUX
+            speed_switch_pending = self.cmux_baudrate != self.baudrate
+        else:
+            print(f"  No AT response (hex: {warmup.hex() if warmup else 'empty'}), may already be in CMUX mode")
+            print("  trying to send SABM frame directly...")
+            self.send_raw(make_sabm(0))
+            cmux_cmd = None
+            speed_switch_pending = False
+
+        resp = self._read_cmux_response()
+
+        # Some firmware only accepts the bare command — if the extended
+        # parameter set gets rejected, retry without parameters. The module
+        # then enters CMUX at the current speed, so no host-side reopen.
+        if b"ERROR" in resp and cmux_cmd is not None and cmux_cmd != "AT+CMUX=0":
+            print(f"  [Retry] device rejected '{cmux_cmd}', falling back to AT+CMUX=0")
+            self.send_at("AT+CMUX=0")
+            resp = self._read_cmux_response()
+            speed_switch_pending = False
 
         text = resp.decode('utf-8', errors='replace').strip()
         print(f"  Raw response: {resp.hex() if resp else 'empty'}")
@@ -312,10 +529,16 @@ class CmuxTE:
         if b"OK" in resp:
             print("  CMUX mode activated")
 
+        # Module UART now runs at <port_speed> — host side follows
+        if speed_switch_pending and b"OK" in resp:
+            step += 1
+            self._reopen_serial(step)
+
         # wait for UE side serial handover (AT reader → CMUX reader)
         time.sleep(1.0)
 
-        print("\n[Step 3] Establish DLCI 0 (control channel)")
+        step += 1
+        print(f"\n[Step {step}] Establish DLCI 0 (control channel)")
         if not self.establish_dlc(0):
             # serial handover may not be complete, retrying once
             print("  [Retry] wait 1s then retry DLCI 0...")
@@ -323,22 +546,21 @@ class CmuxTE:
             if not self.establish_dlc(0):
                 print("  [Fatal] control channel setup failed, cannot continue")
                 return False
+        self.mux_established = True
         time.sleep(0.2)
 
-        print("\n[Step 4] Establish DLCI 1 (data channel 1)")
-        if not self.establish_dlc(1):
-            print("  [Warning] DLCI 1 setup failed")
-        time.sleep(0.2)
-
-        print("\n[Step 5] Establish DLCI 2 (data channel 2)")
-        if not self.establish_dlc(2):
-            print("  [Warning] DLCI 2 setup failed")
+        step += 1
+        print(f"\n[Step {step}] Establish data channels")
+        for dlci in range(1, self.channels + 1):
+            if not self.establish_dlc(dlci):
+                print(f"  [Warning] DLCI {dlci} setup failed")
+            time.sleep(0.2)
 
         print("\n" + "=" * 60)
         print("  CMUX Initialization complete!")
-        print(f"  DLCI 0: {'✓' if self.dlc_available[0] else '✗'}")
-        print(f"  DLCI 1: {'✓' if self.dlc_available[1] else '✗'}")
-        print(f"  DLCI 2: {'✓' if self.dlc_available[2] else '✗'}")
+        for dlci in sorted(self.dlc_available):
+            label = 'control' if dlci == 0 else f'data {dlci}'
+            print(f"  DLCI {dlci} ({label}): {'✓' if self.dlc_available[dlci] else '✗'}")
         fc_status = ', '.join(
             f"DLCI {d}: {'allowed' if a else 'blocked'}"
             for d, a in self.frame_allowed.items()
@@ -357,8 +579,9 @@ class CmuxTransport:
 
     def __init__(self, frame_size: int = 0, verbose: bool = False,
                  keepalive: float = DEFAULT_KEEPALIVE_INTERVAL,
-                 keepalive_threshold: int = DEFAULT_KEEPALIVE_THRESHOLD):
-        self._cmux = CmuxTE(frame_size=frame_size, verbose=verbose)
+                 keepalive_threshold: int = DEFAULT_KEEPALIVE_THRESHOLD,
+                 channels: int = 2):
+        self._cmux = CmuxTE(frame_size=frame_size, verbose=verbose, channels=channels)
         self._verbose = verbose
         self._on_frame: Optional[Callable[[int, bytes], None]] = None
         self._running = False
@@ -392,8 +615,8 @@ class CmuxTransport:
 
     # ---- TransportInterface methods ----
 
-    def open(self, port: str, baudrate: int) -> None:
-        self._cmux.open(port, baudrate)
+    def open(self, port: str, baudrate: int, cmux_baudrate: int = None) -> None:
+        self._cmux.open(port, baudrate, cmux_baudrate)
         if not self._cmux.init_cmux():
             raise RuntimeError("CMUX initialization failed")
 
@@ -627,8 +850,8 @@ class CmuxTransport:
 
             # Reset local mux state so init starts clean
             te.parser = FrameParser()
-            te.dlc_available = {0: False, 1: False, 2: False}
-            te.frame_allowed = {1: True, 2: True}
+            te.dlc_available = {d: False for d in range(te.channels + 1)}
+            te.frame_allowed = {d: True for d in range(1, te.channels + 1)}
             with te._fc_cond:
                 te._fc_cond.notify_all()  # wake senders stalled on the dead link
 

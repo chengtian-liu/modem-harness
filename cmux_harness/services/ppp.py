@@ -176,11 +176,11 @@ class PppService(ServiceInterface):
         )
         self._ppp_thread.start()
 
-    def stop(self, fast=False) -> None:
+    def stop(self, fast=False, teardown_serial=True) -> None:
         if self._running:
             print(f"\n  [PPP] stopping{' (fast)' if fast else ''}...")
             self._harness.transport.dialing = True
-            self._disconnect(fast=fast)
+            self._disconnect(fast=fast, teardown_serial=teardown_serial)
             self._running = False
             if self._ppp_thread:
                 self._ppp_thread.join(timeout=5)
@@ -764,17 +764,24 @@ class PppService(ServiceInterface):
                 time.sleep(0.05)
         return False
 
-    def _disconnect(self, fast=False):
+    def _disconnect(self, fast=False, teardown_serial=True):
         self._harness.events.fire(Event.PPP_DISCONNECTING)
 
         self._stop_tun(fast=fast)
 
         if self._lcp_up:
             self._send_lcp_term_req()
-            if fast:
+            if fast and not teardown_serial:
+                # Link-loss path: the CMUX link is being reset anyway and
+                # no reply will come back — don't sit around waiting.
                 time.sleep(0.3)
             else:
-                deadline = time.time() + 3.0
+                # Wait for the Terminate-Ack so the channel actually leaves
+                # PPP data mode before we hang it up. This loop also keeps
+                # draining the module's output while the transport reader
+                # is stopped — if that backlog is left unread the module
+                # stops processing our frames before mux teardown starts.
+                deadline = time.time() + (1.5 if fast else 3.0)
                 while self._lcp_up and time.time() < deadline:
                     transport = self._harness.transport
                     raw = transport.serial_port.read(transport.serial_port.in_waiting or 1)
@@ -798,6 +805,15 @@ class PppService(ServiceInterface):
         time.sleep(0.3 if fast else 1.0)
         transport = self._harness.transport
         state = self._harness.state
+
+        if fast and state.mode == 'cmux' and not teardown_serial:
+            # Link-loss path only: the CMUX link was declared dead by the
+            # keepalive, so serial interaction cannot succeed and would
+            # only cost timeouts. Drop PPP state; the transport will
+            # re-initialise the mux from scratch.
+            print(f"  [PPP] disconnect sequence complete ✓")
+            self._harness.events.fire(Event.PPP_DISCONNECTED)
+            return
 
         # +++ to exit transparent mode (must wait before ATH)
         if state.mode == 'serial':

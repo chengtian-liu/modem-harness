@@ -15,8 +15,15 @@ class TransportInterface(ABC):
     """
 
     @abstractmethod
-    def open(self, port: str, baudrate: int) -> None:
-        """Open the transport. Must be called before start_reader()."""
+    def open(self, port: str, baudrate: int, cmux_baudrate: int = None) -> None:
+        """Open the transport. Must be called before start_reader().
+
+        baudrate — initial serial speed used for the AT handshake.
+        cmux_baudrate — CMUX target speed; when it differs from baudrate
+        the module switches its UART via AT+CMUX <port_speed> and the
+        transport reopens the port at the new speed. None = same as
+        baudrate. Ignored by the serial transport.
+        """
         ...
 
     @abstractmethod
