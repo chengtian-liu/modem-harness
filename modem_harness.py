@@ -216,9 +216,56 @@ def _ensure_admin():
 # Interactive port selection
 # ============================================================
 
-def _interactive_setup(is_first_run: bool = True):
-    import serial.tools.list_ports as list_ports
+def _port_sort_key(device: str):
+    """Sort COM ports numerically (COM2 < COM11 < COM200), others last."""
+    import re
+    m = re.fullmatch(r'COM(\d+)', device.upper())
+    return (0, int(m.group(1))) if m else (1, device)
 
+
+def _list_all_ports():
+    """pyserial comports() + com0com virtual ports.
+
+    com0com ports are not registered under HARDWARE\\DEVICEMAP\\SERIALCOMM,
+    so pyserial misses them; read their names from the driver's own
+    registry key (SYSTEM\\CurrentControlSet\\Services\\com0com\\Parameters).
+    """
+    import serial.tools.list_ports as list_ports
+    from serial.tools.list_ports_common import ListPortInfo
+
+    ports = [p for p in list_ports.comports() if p.device]
+    seen = {p.device.upper() for p in ports}
+
+    try:
+        import winreg
+        base = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                              r"SYSTEM\CurrentControlSet\Services\com0com\Parameters")
+        try:
+            for i in range(winreg.QueryInfoKey(base)[0]):
+                try:
+                    sub = winreg.EnumKey(base, i)
+                except OSError:
+                    break
+                try:
+                    with winreg.OpenKey(base, sub) as k:
+                        name = str(winreg.QueryValueEx(k, "PortName")[0]).strip()
+                except OSError:
+                    continue  # unnamed/removed port ("-")
+                if name.upper().startswith('COM') and name.upper() not in seen:
+                    seen.add(name.upper())
+                    info = ListPortInfo(name)
+                    info.description = f"com0com virtual serial port ({sub})"
+                    info.hwid = r"com0com"
+                    ports.append(info)
+        finally:
+            winreg.CloseKey(base)
+    except (OSError, ImportError):
+        pass  # com0com not installed (or not Windows)
+
+    return sorted(ports, key=lambda p: _port_sort_key(p.device))
+
+
+def _interactive_setup(is_first_run: bool = True):
     if is_first_run:
         ctypes.windll.kernel32.SetConsoleTitleW("Modem Harness")
         print("=" * 60)
@@ -233,8 +280,8 @@ def _interactive_setup(is_first_run: bool = True):
         print("=" * 60)
         print()
 
-    ports = [p for p in sorted(list_ports.comports(), key=lambda p: p.device)
-              if p.device and (p.device.upper().startswith('COM') or p.device.startswith('/dev/'))]
+    ports = [p for p in _list_all_ports()
+              if p.device.upper().startswith('COM') or p.device.startswith('/dev/')]
     if not ports:
         print("  no available serial ports detected!")
         port = input("  please enter serial port manually (e.g. COM11): ").strip()
