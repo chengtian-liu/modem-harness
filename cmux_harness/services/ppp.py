@@ -4,6 +4,7 @@ import os
 import time
 import struct
 import ctypes
+import hashlib
 from ctypes import c_void_p
 import threading
 import subprocess
@@ -12,13 +13,15 @@ from typing import Optional, TYPE_CHECKING
 from .base import ServiceInterface
 from ..events import Event
 from ..protocol.ppp import (
-    PPP_FLAG, PPP_ADDR, PPP_CTRL, PPP_IP, PPP_LCP, PPP_IPCP, PPP_PAP, PPP_IPV6CP,
-    LCP_MRU, LCP_ACCM, LCP_MAGIC, LCP_PROTOCOMP, LCP_ACFC,
+    PPP_FLAG, PPP_ADDR, PPP_CTRL, PPP_IP, PPP_LCP, PPP_IPCP, PPP_PAP, PPP_CHAP,
+    PPP_IPV6CP,
+    LCP_MRU, LCP_ACCM, LCP_AUTH, LCP_MAGIC, LCP_PROTOCOMP, LCP_ACFC,
     LCP_CONF_REQ, LCP_CONF_ACK, LCP_CONF_NAK, LCP_CONF_REJ,
     LCP_TERM_REQ, LCP_TERM_ACK, LCP_CODE_REJ, LCP_ECHO_REQ, LCP_ECHO_REP,
     IPCP_CONF_REQ, IPCP_CONF_ACK, IPCP_CONF_NAK, IPCP_CONF_REJ,
     IPCP_IPADDR, IPCP_PRIDNS, IPCP_SECDNS,
     PAP_REQ, PAP_ACK, PAP_NAK,
+    CHAP_CHALLENGE, CHAP_RESPONSE, CHAP_SUCCESS, CHAP_FAILURE, CHAP_MD5,
     IPV6CP_IFACE_ID,
     make_ppp_frame, PppParser,
 )
@@ -43,6 +46,14 @@ class PppService(ServiceInterface):
         self._lcp_up = False
         self._ipcp_up = False
         self._auth_up = True
+        self._auth_protocol: Optional[int] = None   # set from peer LCP CONF_REQ (LCP_AUTH option)
+        self._auth_failed = False
+        self._auth_nak_msg = ''
+        self._peer_conf_req_seen = False            # peer's own LCP CONF_REQ arrived
+        self._auth_user = ''                         # credentials for PAP/CHAP
+        self._auth_password = ''
+        self._chap_algorithm = 0                     # algorithm byte from peer LCP auth option
+        self._chap_alg_naked = False                 # already sent CONF-NAK for unsupported algorithm
         self._local_ip = None
         self._remote_ip = None
         self._dns = []
@@ -81,17 +92,33 @@ class PppService(ServiceInterface):
         # Start PPP
         dlci = 2
         apn = ''
+        user = ''
+        password = ''
         # Parse arguments
         i = 1
         while i < len(args):
             if args[i] == '--apn' and i + 1 < len(args):
                 apn = args[i + 1]
                 i += 2
+            elif args[i] in ('--user', '--username') and i + 1 < len(args):
+                user = args[i + 1]
+                i += 2
+            elif args[i] in ('--pass', '--password') and i + 1 < len(args):
+                password = args[i + 1]
+                i += 2
             elif args[i].isdigit():
                 dlci = int(args[i])
                 i += 1
             else:
                 i += 1
+
+        # Prompt for password (hidden) only if username given without password
+        if user and not password:
+            try:
+                import getpass
+                password = getpass.getpass('  Password: ')
+            except (EOFError, KeyboardInterrupt):
+                pass
 
         # Prompt for hardware flow control
         self._hw_flow = False
@@ -106,7 +133,7 @@ class PppService(ServiceInterface):
         except (EOFError, KeyboardInterrupt):
             pass
 
-        self.start(dlci, apn)
+        self.start(dlci, apn, user, password)
         return None
 
     def on_shutdown(self) -> None:
@@ -222,6 +249,28 @@ class PppService(ServiceInterface):
         self._running = True
         self._harness.state.update(ppp_running=True)
 
+        # Reset per-dial negotiation state (a redial must start clean)
+        self._lcp_up = False
+        self._ipcp_up = False
+        self._auth_up = True
+        self._auth_protocol = None
+        self._auth_failed = False
+        self._auth_nak_msg = ''
+        self._peer_conf_req_seen = False
+        self._auth_user = user
+        self._auth_password = password
+        self._chap_algorithm = 0
+        self._chap_alg_naked = False
+        self._local_ip = None
+        self._remote_ip = None
+        self._dns = []
+        self._peer_wants_pfc = False
+        self._peer_wants_acfc = False
+        self._acfc_enabled = False
+        self._pfc_enabled = False
+        self._lcp_rejected_options.clear()
+        self._ipcp_rejected_options.clear()
+
         self._engine_thread = threading.Thread(target=self._process_ppp, daemon=True)
         self._engine_thread.start()
 
@@ -240,19 +289,74 @@ class PppService(ServiceInterface):
         self._harness.state.update(ppp_lcp_up=True)
         self._harness.events.fire(Event.PPP_LCP_UP)
 
+        # The peer's CONF_REQ (which carries the Authenticate-Protocol option)
+        # normally arrives before/along with its CONF-ACK of ours. Give it a
+        # short grace period so we don't miss an auth requirement.
+        grace = time.time() + 2
+        while not self._peer_conf_req_seen and self._running and time.time() < grace:
+            time.sleep(0.05)
+
         if not self._auth_up:
-            print(f"\n  [PPP] --- PAP authentication ---")
-            user_bytes = user.encode() if user else b''
-            pwd_bytes = password.encode() if password else b''
-            info = bytes([PAP_REQ, self._next_id(), len(user_bytes)]) + user_bytes + \
-                   bytes([len(pwd_bytes)]) + pwd_bytes
-            self._send_ppp(PPP_PAP, info)
-            auth_timeout = time.time() + 5
-            while not self._auth_up and self._running and time.time() < auth_timeout:
-                time.sleep(0.1)
+            if self._auth_protocol == PPP_CHAP:
+                print(f"\n  [PPP] --- CHAP authentication ---")
+                if not self._auth_password:
+                    print(f"  [PPP] warning: peer requests CHAP but no password given")
+                    print(f"        (use: ppp --apn <apn> --user <name> --pass <pwd>)")
+                # CHAP is peer-driven: wait for the Challenge, reply, then wait
+                # for Success/Failure. The engine thread (_handle_chap) does the
+                # actual reply; here we just wait for the outcome.
+                auth_timeout = time.time() + 8
+                while not self._auth_up and not self._auth_failed and self._running \
+                        and time.time() < auth_timeout:
+                    time.sleep(0.1)
+            else:
+                print(f"\n  [PPP] --- PAP authentication ---")
+                if not user and not password:
+                    print(f"  [PPP] warning: peer requests auth but no credentials given")
+                    print(f"        (use: ppp --apn <apn> --user <name> --pass <pwd>)")
+                user_bytes = user.encode() if user else b''
+                pwd_bytes = password.encode() if password else b''
+                # RFC 1334 Authenticate-Request:
+                #   code(1) id(1) length(2) peer-id-len(1) peer-id peer-pwd-len(1) peer-pwd
+                body = bytes([len(user_bytes)]) + user_bytes + \
+                       bytes([len(pwd_bytes)]) + pwd_bytes
+                # RFC 1334: retransmit on the restart timer until
+                # Max-Authenticate attempts are exhausted.
+                max_attempts = 3
+                for attempt in range(1, max_attempts + 1):
+                    if self._auth_up or self._auth_failed or not self._running:
+                        break
+                    req_id = self._next_id()
+                    info = bytes([PAP_REQ, req_id, 0, 0]) + body
+                    info = info[:2] + struct.pack('>H', len(info)) + info[4:]
+                    self._send_ppp(PPP_PAP, info)
+                    suffix = f" (attempt {attempt}/{max_attempts})" if attempt > 1 else ''
+                    print(f"  [PPP] PAP → Authenticate-Request (id={req_id}, "
+                          f"user='{user}'){suffix}")
+                    retry_deadline = time.time() + 3
+                    while not self._auth_up and not self._auth_failed and self._running \
+                            and time.time() < retry_deadline:
+                        time.sleep(0.1)
+
+            if self._auth_failed:
+                proto = 'CHAP' if self._auth_protocol == PPP_CHAP else 'PAP'
+                print(f"  [PPP] ✗ {proto} authentication rejected: "
+                      f"{self._auth_nak_msg or 'unknown reason'}")
+                # Pause the transport reader (same exclusive-access pattern
+                # as stop()) before running the disconnect sequence.
+                transport = self._harness.transport
+                transport.dialing = True
+                self._disconnect(fast=False, teardown_serial=True)
+                transport.dialing = False
+                self._running = False
+                self._harness.state.update(ppp_running=False, ppp_lcp_up=False)
+                return
             if not self._auth_up:
-                print(f"  [PPP] auth timeout (continuing...)")
+                proto = 'CHAP' if self._auth_protocol == PPP_CHAP else 'PAP'
+                print(f"  [PPP] {proto} auth timeout (continuing...)")
                 self._auth_up = True
+            else:
+                self._harness.events.fire(Event.PPP_AUTH_DONE)
 
         print(f"\n  [PPP] --- IPv6CP + IPCP negotiation ---")
         self._send_ipv6cp_conf_req()
@@ -429,12 +533,9 @@ class PppService(ServiceInterface):
             elif proto == PPP_IPV6CP:
                 self._handle_ipv6cp(info)
             elif proto == PPP_PAP:
-                if len(info) >= 2 and info[0] == PAP_ACK:
-                    print(f"  [PPP] PAP ← Authenticate-ACK ✓")
-                    self._auth_up = True
-                elif len(info) >= 2 and info[0] == PAP_NAK:
-                    print(f"  [PPP] PAP ← Authenticate-NAK (continue)")
-                    self._auth_up = True
+                self._handle_pap(info)
+            elif proto == PPP_CHAP:
+                self._handle_chap(info)
             elif proto == PPP_IP:
                 if len(info) >= 20:
                     # Forward to TUN
@@ -448,6 +549,62 @@ class PppService(ServiceInterface):
                         except Exception as e:
                             print(f"  [PPP→TUN] error: {e}")
 
+    def _handle_pap(self, info: bytes):
+        if len(info) < 4:
+            return
+        code = info[0]
+        msg = ''
+        if len(info) >= 5:
+            msg_len = info[4]
+            msg = info[5:5 + msg_len].decode('latin-1', errors='replace')
+        if code == PAP_ACK:
+            print(f"  [PPP] PAP ← Authenticate-ACK ✓{(' (' + msg + ')') if msg else ''}")
+            self._auth_up = True
+        elif code == PAP_NAK:
+            print(f"  [PPP] PAP ← Authenticate-NAK{(' (' + msg + ')') if msg else ''}")
+            self._auth_nak_msg = msg
+            self._auth_failed = True
+
+    def _handle_chap(self, info: bytes):
+        if len(info) < 4:
+            return
+        code = info[0]
+        ident = info[1]
+        length = (info[2] << 8) | info[3]
+        data = info[4:length]
+
+        if code == CHAP_CHALLENGE:
+            if len(data) < 2:
+                return
+            value_len = data[0]
+            challenge = data[1:1 + value_len]
+            name = data[1 + value_len:].decode('latin-1', errors='replace')
+            print(f"  [PPP] CHAP ← Challenge (id={ident}, {len(challenge)}B, "
+                  f"authenticator='{name}')")
+
+            user_bytes = self._auth_user.encode() if self._auth_user else b''
+            pwd_bytes = self._auth_password.encode() if self._auth_password else b''
+            # RFC 1994: Response value = MD5(id || secret || challenge)
+            digest = hashlib.md5(bytes([ident]) + pwd_bytes + challenge).digest()
+
+            # code(1) id(1) length(2) value-size(1) value(16) name
+            body = bytes([len(digest)]) + digest + user_bytes
+            resp = bytes([CHAP_RESPONSE, ident, 0, 0]) + body
+            resp = resp[:2] + struct.pack('>H', len(resp)) + resp[4:]
+            self._send_ppp(PPP_CHAP, resp)
+            print(f"  [PPP] CHAP → Response (id={ident}, MD5, name='{self._auth_user}')")
+
+        elif code == CHAP_SUCCESS:
+            msg = data.decode('latin-1', errors='replace')
+            print(f"  [PPP] CHAP ← Success ✓{(' (' + msg + ')') if msg else ''}")
+            self._auth_up = True
+
+        elif code == CHAP_FAILURE:
+            msg = data.decode('latin-1', errors='replace')
+            print(f"  [PPP] CHAP ← Failure{(' (' + msg + ')') if msg else ''}")
+            self._auth_nak_msg = msg
+            self._auth_failed = True
+
     def _handle_lcp(self, info: bytes):
         if len(info) < 4:
             return
@@ -458,6 +615,7 @@ class PppService(ServiceInterface):
 
         if code == LCP_CONF_REQ:
             print(f"  [PPP] LCP ← Configure-Request (id={ident})")
+            self._peer_conf_req_seen = True
             pos = 0
             while pos < len(data):
                 if pos + 1 >= len(data):
@@ -470,6 +628,36 @@ class PppService(ServiceInterface):
                     self._peer_wants_acfc = True
                 elif opt_type == LCP_PROTOCOMP:
                     self._peer_wants_pfc = True
+                elif opt_type == LCP_AUTH and opt_len >= 4:
+                    # Authenticate-Protocol: 2-byte protocol number after type/len
+                    auth_proto = (data[pos + 2] << 8) | data[pos + 3]
+                    if auth_proto == PPP_PAP:
+                        self._auth_protocol = PPP_PAP
+                        self._auth_up = False
+                        print(f"  [PPP] LCP ← peer requests PAP authentication")
+                    elif auth_proto == PPP_CHAP:
+                        self._auth_protocol = PPP_CHAP
+                        self._auth_up = False
+                        alg = data[pos + 4] if opt_len >= 5 else 0
+                        self._chap_algorithm = alg
+                        alg_name = 'MD5' if alg == CHAP_MD5 else f'unknown({alg})'
+                        print(f"  [PPP] LCP ← peer requests CHAP authentication (algorithm={alg_name})")
+                        if alg != CHAP_MD5:
+                            # We only implement MD5. Per RFC 1994, Nak the
+                            # request once with the algorithm we support so
+                            # the peer can renegotiate.
+                            if not self._chap_alg_naked:
+                                self._chap_alg_naked = True
+                                nak_opts = bytes([LCP_AUTH, 5, 0xC2, 0x23, CHAP_MD5])
+                                info_nak = bytes([LCP_CONF_NAK, ident, 0, 0]) + nak_opts
+                                info_nak = info_nak[:2] + struct.pack('>H', len(info_nak)) + info_nak[4:]
+                                self._send_ppp(PPP_LCP, info_nak)
+                                print(f"  [PPP] LCP → Configure-NAK (only CHAP-MD5 supported)")
+                                return
+                            print(f"  [PPP] LCP warning: peer insists on algorithm {alg}, "
+                                  f"attempting MD5 anyway")
+                    else:
+                        print(f"  [PPP] LCP ← peer requests unknown auth protocol 0x{auth_proto:04X}")
                 pos += opt_len
             self._send_lcp_conf_ack(ident, data)
         elif code == LCP_CONF_ACK:

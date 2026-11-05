@@ -215,7 +215,7 @@ class CmuxHarness:
 
         # PPP mode: route all non-quit commands to services
         if first == 'ppp':
-            # ppp, ppp stop, ppp <dlci>, ppp --apn <apn>
+            # ppp, ppp stop, ppp <dlci>, ppp --apn <apn> --user <u> --pass <p>
             ppp = self._services.get('ppp')
             if ppp:
                 ppp.on_command(parts)
@@ -339,7 +339,7 @@ class CmuxHarness:
         if self._mode == 'serial':
             print(f"  [Serial Mode] — Direct Serial")
             print(f"  {sep}")
-            print(f"    ppp                             Start PPP dialup")
+            print(f"    ppp [--user U --pass P]         Start PPP dialup")
             print(f"    ppp stop                        Stop PPP")
             print(f"    ping [args]                     System ping (e.g. ping -l 1024 8.8.8.8)")
             print(f"    ftp upload <local> <remote>     Upload file via FTP")
@@ -354,7 +354,7 @@ class CmuxHarness:
             print(f"    1>ATI                           Send AT command on DLCI 1")
             if self._channels >= 2:
                 print(f"    {f'{self._channels}>AT+CSQ'.ljust(32)}Send AT command on DLCI {self._channels}")
-            print(f"    ppp [dlci]                      Start PPP dialup (default: DLCI 2)")
+            print(f"    ppp [dlci] [--apn A --user U --pass P]  Start PPP dialup (default: DLCI 2)")
             print(f"    ppp stop                        Stop PPP")
             print(f"    ping [args]                     System ping (e.g. ping -l 1024 8.8.8.8)")
             print(f"    ftp upload <local> <remote>     Upload file via FTP")
