@@ -128,7 +128,7 @@ Once connected:
 |---------------------------------|-----------------------------------------------------------------------------|
 | `at <cmd>`                      | Send AT command (DLCI 1 in CMUX mode, direct in serial mode)                |
 | `N>AT+CSQ`                      | Send AT command on DLCI N (CMUX mode only, N = 1..channel count)            |
-| `ppp [dlci] [--apn APN] [--user U --pass P]` | Start PPP dialup on given DLCI (default DLCI 2, no DLCI in serial mode). PAP credentials are sent only if the peer requests authentication during LCP; `--pass` may be omitted to get a hidden prompt |
+| `ppp [dlci] [--cid N] [--user U --pass P]` | Start PPP dialup on given DLCI (default DLCI 2, no DLCI in serial mode). `--cid` selects the PDP context (`ATD*99**1*N#`, must be configured via `AT+CGDCONT` first); omitted → `ATD*99**1#` (default context). PAP credentials are sent only if the peer requests authentication during LCP; `--pass` may be omitted to get a hidden prompt |
 | `ppp stop`                      | Stop PPP                                                                    |
 | `ping [ip] [size]`              | Ping target IP (default 8.8.8.8, 32B)                                       |
 | `ftp upload <local> <remote>`   | Upload file and measure speed                                               |
@@ -441,14 +441,14 @@ The TUN virtual adapter requires administrator privileges. When the UAC prompt a
 
 ### "CONNECT not received" / PPP negotiation timeout
 
-- Verify the APN is correct: `ppp --apn cmnet` (or your carrier's APN).
+- Verify the PDP context / APN is configured: `at AT+CGDCONT=1,"IP","cmnet"`, then dial with `ppp --cid 1` (or your carrier's APN).
 - Check that the LTE module is registered on the network: `at AT+CREG?`
 - Try a different DLCI: `ppp 3`
 
 ### "authentication rejected" (PAP)
 
 - The peer requested PAP during LCP and NAK'd the credentials.
-- Pass credentials explicitly: `ppp --apn <apn> --user <name> --pass <pwd>`
+- Pass credentials explicitly: `ppp [--cid <n>] --user <name> --pass <pwd>`
 - Or omit `--pass` to enter it via a hidden prompt.
 - If the peer requests CHAP, MD5 is supported (`CHAP ← Challenge` →
   `CHAP → Response`). Other CHAP algorithms are Nak'd during LCP so the

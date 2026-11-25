@@ -91,14 +91,18 @@ class PppService(ServiceInterface):
 
         # Start PPP
         dlci = 2
-        apn = ''
+        cid = None
         user = ''
         password = ''
         # Parse arguments
         i = 1
         while i < len(args):
-            if args[i] == '--apn' and i + 1 < len(args):
-                apn = args[i + 1]
+            if args[i] == '--cid' and i + 1 < len(args):
+                try:
+                    cid = int(args[i + 1])
+                except ValueError:
+                    print(f"  Invalid cid: {args[i + 1]}")
+                    return None
                 i += 2
             elif args[i] in ('--user', '--username') and i + 1 < len(args):
                 user = args[i + 1]
@@ -133,7 +137,7 @@ class PppService(ServiceInterface):
         except (EOFError, KeyboardInterrupt):
             pass
 
-        self.start(dlci, apn, user, password)
+        self.start(dlci, cid, user, password)
         return None
 
     def on_shutdown(self) -> None:
@@ -141,7 +145,7 @@ class PppService(ServiceInterface):
 
     # ---- Public API ----
 
-    def start(self, dlci: int = 2, apn: str = '', user: str = '', password: str = '') -> None:
+    def start(self, dlci: int = 2, cid: Optional[int] = None, user: str = '', password: str = '') -> None:
         if self._running:
             print(f"  PPP already running, please execute ppp stop first")
             return
@@ -164,10 +168,11 @@ class PppService(ServiceInterface):
         # Set dialing lock
         transport.dialing = True
 
-        # Send dial command
-        dial_cmd = 'ATD*99#'
-        if apn:
-            dial_cmd = 'ATD*99***1#'
+        # Send dial command: ATD*<GPRS_SC>[*[<addr>][*[<L2P>][*[<cid>]]]]#
+        # L2P is always 1 (PPP); no cid → module uses default PDP context
+        dial_cmd = 'ATD*99**1#'
+        if cid is not None:
+            dial_cmd = f'ATD*99**1*{cid}#'
 
         if state.mode == 'serial':
             print(f"  [PPP] → {dial_cmd}")
@@ -198,7 +203,7 @@ class PppService(ServiceInterface):
         self._harness.events.fire(Event.PPP_STARTING)
 
         self._ppp_thread = threading.Thread(
-            target=self._run, args=(apn, user, password),
+            target=self._run, args=(user, password),
             daemon=True
         )
         self._ppp_thread.start()
@@ -245,7 +250,7 @@ class PppService(ServiceInterface):
 
     # ---- PPP Engine ----
 
-    def _run(self, apn: str = '', user: str = '', password: str = ''):
+    def _run(self, user: str = '', password: str = ''):
         self._running = True
         self._harness.state.update(ppp_running=True)
 
@@ -301,7 +306,7 @@ class PppService(ServiceInterface):
                 print(f"\n  [PPP] --- CHAP authentication ---")
                 if not self._auth_password:
                     print(f"  [PPP] warning: peer requests CHAP but no password given")
-                    print(f"        (use: ppp --apn <apn> --user <name> --pass <pwd>)")
+                    print(f"        (use: ppp [--cid <n>] --user <name> --pass <pwd>)")
                 # CHAP is peer-driven: wait for the Challenge, reply, then wait
                 # for Success/Failure. The engine thread (_handle_chap) does the
                 # actual reply; here we just wait for the outcome.
@@ -313,7 +318,7 @@ class PppService(ServiceInterface):
                 print(f"\n  [PPP] --- PAP authentication ---")
                 if not user and not password:
                     print(f"  [PPP] warning: peer requests auth but no credentials given")
-                    print(f"        (use: ppp --apn <apn> --user <name> --pass <pwd>)")
+                    print(f"        (use: ppp [--cid <n>] --user <name> --pass <pwd>)")
                 user_bytes = user.encode() if user else b''
                 pwd_bytes = password.encode() if password else b''
                 # RFC 1334 Authenticate-Request:
